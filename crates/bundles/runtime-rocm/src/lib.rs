@@ -1,19 +1,38 @@
-//! Supported AMD runtime (Windows, ROCm/HIP): an explicit Candle ROCm media catalog.
+//! Supported AMD runtime (Windows, ROCm/HIP): Candle on the ROCm backend.
 //!
-//! Deliberately smaller than `runtime-cuda`: only providers that have been validated on ROCm are
-//! composed in (currently SeedVR2). There is no LLM or audio lane here, so nothing is advertised that
-//! cannot run on an AMD GPU. Providers are added to [`providers`] and [`media_registry`] as they are
-//! validated; the NVIDIA, macOS and CPU bundles are unaffected.
+//! The *public surface* mirrors `runtime-cuda` (same module and item names) so SceneWorks' worker -- written
+//! against `runtime_cuda::...` -- compiles unchanged against this bundle when built through the AMD build
+//! configuration (`amd/`). The *catalog* is deliberately honest and smaller: only providers that have been
+//! validated on ROCm are registered (currently SeedVR2), with no LLM or audio lane. Everything else is linked
+//! for compilation only and is never advertised, so an AMD worker cannot claim work it cannot run.
+//! Add a provider to [`media_registry`] once it has been validated on ROCm.
 
-pub use candle_gen as media;
+pub use candle_gen_catalog::{media, vae_tiling};
+pub use candle_llm as llm;
 pub use runtime_catalog::{
     core_llm, gen_core, memory_strategy, RuntimeCatalog, RuntimeCatalogSnapshot,
     VideoDecodeMemoryProfile,
 };
 
-/// The Candle backend crates this platform owns (ROCm-validated only).
+/// Resolve a provider-owned conservative VAE decode profile (same contract as `runtime-cuda`).
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<VideoDecodeMemoryProfile> {
+    candle_gen_catalog::conservative_video_decode_memory_profile(provider_id, width, height, frames)
+}
+
+/// The Candle backend crates, re-exported for source compatibility with `runtime-cuda`. Only the providers
+/// registered in [`catalog`] (SeedVR2) are validated on ROCm; the rest are compile-surface only.
 pub mod providers {
-    pub use candle_gen_seedvr2 as seedvr2;
+    pub use candle_gen_catalog::providers::*;
+}
+
+/// AMD GPUs have no NVFP4 tensor-core tier, so this bundle surfaces no advanced quant tiers.
+pub fn nvfp4_quant_tiers() -> &'static [gen_core::Quant] {
+    &[]
 }
 
 /// Platform label for this bundle; matches `RuntimeCatalog::platform`.
@@ -28,22 +47,8 @@ pub const NATIVE_PREREQUISITES: &[&str] = &[
     "supported AMD Radeon GPU and driver (RDNA3 / gfx1100 validated)",
 ];
 
-/// No ROCm provider currently publishes a conservative video-decode memory profile.
-pub fn conservative_video_decode_memory_profile(
-    _provider_id: &str,
-    _width: u32,
-    _height: u32,
-    _frames: u32,
-) -> Option<VideoDecodeMemoryProfile> {
-    None
-}
-
-fn media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
-    candle_gen_seedvr2::provider_registry()
-}
-
-/// The catalog requires a declared snapshot preparer on every runtime. The ROCm bundle ships no LLM
-/// or audio lane, so its preparer never claims a snapshot and fails loudly if it is ever driven.
+/// The catalog requires a declared snapshot preparer on every runtime. This bundle advertises no LLM or audio
+/// lane, so its preparer never claims a snapshot and fails loudly if it is ever driven.
 fn preparer_backend() -> &'static str {
     BACKEND
 }
@@ -67,7 +72,13 @@ fn snapshot_preparers() -> core_llm::Result<core_llm::SnapshotPreparerRegistry> 
         })
         .build()
 }
-/// Build the validated ROCm runtime composition: SeedVR2 media, no LLM/snapshot-preparer/audio lanes.
+
+/// Providers validated on ROCm. Add to this registry as providers are validated.
+fn media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
+    candle_gen_seedvr2::provider_registry()
+}
+
+/// Build the validated ROCm runtime composition: SeedVR2 media; no LLM or audio lane advertised.
 pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
     RuntimeCatalog::try_new(
         PLATFORM,
@@ -89,8 +100,19 @@ mod tests {
         for id in ["seedvr2", "seedvr2_3b", "seedvr2_7b"] {
             assert!(ids.contains(&id), "missing {id} in {ids:?}");
         }
-        assert_eq!(ids.len(), 3, "only SeedVR2 is composed into the ROCm bundle: {ids:?}");
+        assert_eq!(ids.len(), 3, "only SeedVR2 is advertised by the ROCm bundle: {ids:?}");
         assert!(snapshot.text_llm_ids.is_empty());
         assert!(snapshot.audio_generator_ids.is_empty());
+        assert!(super::nvfp4_quant_tiers().is_empty());
+    }
+
+    /// The compile-surface contract: the names SceneWorks' worker uses on `runtime_cuda` resolve here too.
+    #[test]
+    fn exposes_runtime_cuda_compatible_surface() {
+        let _ = super::providers::seedvr2::provider_registry;
+        let _ = super::media::default_device;
+        let _ = super::vae_tiling;
+        let _ = super::llm::text_registry;
+        assert_eq!(super::BACKEND, "candle");
     }
 }

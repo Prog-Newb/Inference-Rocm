@@ -2,11 +2,16 @@
 name = "runtime-rocm"
 version = "0.0.0"
 edition = "2021"
-description = "SceneWorks Candle ROCm (AMD Radeon, Windows) media runtime composition. SeedVR2 upscaling first; further providers are added once validated on ROCm."
+description = "SceneWorks Candle ROCm (AMD Radeon, Windows) runtime composition. Public surface mirrors runtime-cuda; the catalog only advertises providers validated on ROCm (SeedVR2 so far)."
 license = "Apache-2.0"
 repository = "https://github.com/SceneWorks/inference"
 
 [dependencies]
 runtime-catalog = { workspace = true }
+# Compile-surface only: the full provider and LLM crates are linked (WITHOUT their `cuda` features) so a
+# worker written against `runtime-cuda`'s API compiles unchanged. They are NOT registered in `catalog()`.
+candle-gen-catalog = { workspace = true }
+candle-llm = { workspace = true }
+# `rocm` turns on candle-core/rocm for the whole graph (Cargo feature unification).
 candle-gen = { path = "../../media/candle-gen/candle-gen", features = ["rocm"] }
 candle-gen-seedvr2 = { path = "../../media/candle-gen/candle-gen-seedvr2", features = ["rocm"] }
