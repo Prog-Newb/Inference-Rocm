@@ -1,0 +1,12 @@
+[package]
+name = "runtime-rocm"
+version = "0.0.0"
+edition = "2021"
+description = "SceneWorks Candle ROCm (AMD Radeon, Windows) media runtime composition. SeedVR2 upscaling first; further providers are added once validated on ROCm."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+
+[dependencies]
+runtime-catalog = { workspace = true }
+candle-gen = { path = "../../media/candle-gen/candle-gen", features = ["rocm"] }
+candle-gen-seedvr2 = { path = "../../media/candle-gen/candle-gen-seedvr2", features = ["rocm"] }

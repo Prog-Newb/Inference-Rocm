@@ -3395,6 +3395,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-rocm"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-gen-seedvr2",
+ "runtime-catalog",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
