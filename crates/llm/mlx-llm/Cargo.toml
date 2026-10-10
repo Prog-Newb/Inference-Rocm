@@ -1,0 +1,43 @@
+[package]
+name = "mlx-llm"
+version = "0.0.0"
+edition = "2021"
+description = "On-device text + vision LLM serving engine for Apple MLX (work in progress)."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+readme = "README.md"
+keywords = ["mlx", "apple-silicon", "llm", "inference", "serving"]
+categories = ["science"]
+
+# The engine and example server are members of the repository root workspace.
+
+[dependencies]
+# mlx-rs is pinned to the pmetal fork by commit SHA — the SAME pin mlx-gen uses, so the two
+# build ONE mlx-rs and share a single `Array` type (the inversion: mlx-gen will consume mlx-llm).
+# `pmetal-mlx-rs` is mlx-rs 0.25 whose mlx-sys builds MLX core 0.32.0 (epic 12742; faster Metal
+# kernels + the regenerated metallib-search-path patch — command-buffer recovery is upstream in
+# 0.32.0). Aliased as `mlx-rs` so `use mlx_rs::…` is unchanged.
+# Crates.io publish (a later epic-7153 story) will swap this for a registry/patch arrangement;
+# during development it is the fork so the engine actually runs correctly on-device.
+# SHA 38e1cc17 = 44929a00 + sc-7898: metallib resolver (device.cpp) now prefers the build's own
+# compiled-in metallib (METAL_PATH) over the shared ~/.cache/pmetal user cache, so a stale/older
+# pmetal build can't shadow the current build's kernels (small-M bm64 GEMM panic). Kept in lock-step
+# with mlx-gen's pin so the two still build ONE mlx-rs.
+mlx-rs = { workspace = true }
+# The backend-neutral contract this crate implements.
+core-llm = { workspace = true }
+# Error plumbing for the engine surface.
+thiserror = { workspace = true }
+# config.json parsing (HF model configs) — Value-based, no derive, matching the mlx-gen convention.
+serde_json = { workspace = true }
+# half-precision scalar helpers for host-side dtype handling.
+half = "2"
+memmap2 = "0.9"
+
+[dev-dependencies]
+# (Tokenizing for the example + real-weights tests goes through core_llm::Tokenizer — no direct
+# tokenizers dep needed.)
+# Run the registered LlamaProvider through the backend-neutral contract checks.
+core-llm-testkit = { workspace = true }
+# Self-removing fixture roots for the unit + integration suites (sc-17768).
+tempfile = { workspace = true }

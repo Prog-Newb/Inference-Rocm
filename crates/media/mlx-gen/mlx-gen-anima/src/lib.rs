@@ -1,0 +1,160 @@
+//! # mlx-gen-anima
+//!
+//! The **Anima** provider crate for [`mlx-gen`](mlx_gen) — circlestone-labs' anime text-to-image model
+//! (epic 10512). Three variants share **one architecture** and differ only in the DiT weights file:
+//! - **`anima_base`** — the base model (30 steps, CFG 4.5),
+//! - **`anima_aesthetic`** — the aesthetic fine-tune (30 steps, CFG 4.5),
+//! - **`anima_turbo`** — the merged CFG-free few-step student (10 steps, CFG 1.0).
+//!
+//! ## Architecture (verified against the real `circlestone-labs/Anima` checkpoint)
+//! - **DiT** — the **Cosmos-Predict2** `CosmosTransformer3DModel` (`Cosmos-2.0-Diffusion-2B-Text2Image`):
+//!   28 layers, hidden 2048 (16 heads × 128), patch `(1,2,2)`, adaLN-LoRA 256, 3-axis NTK RoPE
+//!   `rope_scale (1,4,4)`, `concat_padding_mask` ⇒ **17-channel** patch-embed input
+//!   ([`transformer::CosmosDiT`]). Net-new port from diffusers `transformer_cosmos.py`.
+//! - **Text conditioner** — the **`AnimaTextConditioner`** (bundled in the DiT file under
+//!   `net.llm_adapter.*`): `nn.Embedding(32128, 1024)` over T5 token ids as learned query tokens →
+//!   6 × [self-attn → cross-attn into Qwen3 states → GELU MLP] → out_proj + RMSNorm, right-padded to
+//!   **512** ([`conditioner::AnimaTextConditioner`]). Net-new port from `condition_embedder_anima.py`.
+//! - **Text encoder** — **Qwen3-0.6B base** (`last_hidden_state`), reusing z-image's Qwen3 decoder
+//!   block ([`text_encoder::AnimaQwen3`]).
+//! - **VAE** — the **Qwen-Image** `AutoencoderKLQwenImage`, reusing `mlx_gen_qwen_image::QwenVae`
+//!   ([`vae`]).
+//! - **Scheduler** — `FlowMatchEulerDiscreteScheduler` static `shift=3.0`, `sigmas = linspace(1, 1/N, N)`
+//!   ([`pipeline::anima_sigmas`]); default solver the recommended `er_sde` (sc-10519).
+//!
+//! Tokenization is dual: Qwen2 BPE (no BOS/EOS, pad 151643) for the encoder, T5 SentencePiece (with
+//! EOS) for the conditioner's query tokens ([`tokenizer`]).
+
+pub mod adapters;
+mod block_stream;
+pub mod conditioner;
+pub mod config;
+pub mod convert;
+pub mod loader;
+pub mod memory_strategy;
+pub mod model;
+pub mod pipeline;
+pub mod prompt_weight;
+pub mod rope;
+pub mod text_encoder;
+pub mod tokenizer;
+pub mod training;
+pub mod transformer;
+pub mod vae;
+
+pub use adapters::{apply_anima_adapters, AnimaAdapterHost};
+pub use conditioner::AnimaTextConditioner;
+pub use config::{ConditionerConfig, DitConfig, Qwen3Config, Variant, RES_MULTIPLE};
+pub use convert::{is_dit_quant_target, quantize_anima_dit};
+pub use loader::{load_conditioning_at_dtype, split_anima_keys, AnimaComponents};
+pub use model::{
+    descriptor_aesthetic, descriptor_base, descriptor_turbo, load_aesthetic, load_base, load_turbo,
+    Anima,
+};
+pub use pipeline::{
+    anima_sigmas, AnimaDecodeView, AnimaLight, AnimaPipeline, GenOptions, DEFAULT_SAMPLER,
+};
+pub use prompt_weight::{parse_prompt_weights, strip_prompt_weights};
+pub use text_encoder::AnimaQwen3;
+pub use training::{
+    trainer_descriptor_aesthetic, trainer_descriptor_base, trainer_descriptor_turbo, AnimaTrainer,
+};
+pub use transformer::CosmosDiT;
+pub use vae::{load_vae, QwenVae};
+
+/// sc-16209 Apple-Silicon warm sweep: Anima Base q8 peaked below 7.67 GiB at 1024².
+pub const BASE_ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryRegistration =
+    mlx_gen::gen_core::ActivationMemoryRegistration {
+        provider_id: "anima_base",
+        anchor: mlx_gen::ActivationMemoryAnchor {
+            bytes_1024: 8_235_599_791,
+        },
+    };
+
+/// Add all MLX Anima generators and trainers to an explicit media registry builder.
+pub fn register_providers(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(model::BASE_REGISTRATION)
+        .register_activation_memory(BASE_ACTIVATION_MEMORY_REGISTRATION)
+        .register_memory_strategy(model::BASE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: "anima_base",
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract("anima_base", spec)
+            },
+        })
+        .register_memory_behavior(model::BASE_MEMORY_BEHAVIOR)
+        .register_generator(model::AESTHETIC_REGISTRATION)
+        .register_memory_strategy(model::AESTHETIC_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: "anima_aesthetic",
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract("anima_aesthetic", spec)
+            },
+        })
+        .register_memory_behavior(model::AESTHETIC_MEMORY_BEHAVIOR)
+        .register_generator(model::TURBO_REGISTRATION)
+        .register_memory_strategy(model::TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: "anima_turbo",
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract("anima_turbo", spec)
+            },
+        })
+        .register_memory_behavior(model::TURBO_MEMORY_BEHAVIOR)
+        .register_trainer(training::BASE_TRAINER_REGISTRATION)
+        .register_trainer(training::AESTHETIC_TRAINER_REGISTRATION)
+        .register_trainer(training::TURBO_TRAINER_REGISTRATION)
+}
+
+/// Build the complete explicit MLX Anima provider catalog.
+pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::ProviderRegistry> {
+    register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_has_stable_surface() {
+        let registry = super::provider_registry().unwrap();
+        let explicit_generators: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let explicit_trainers: Vec<String> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+
+        assert_eq!(
+            explicit_generators,
+            ["anima_base", "anima_aesthetic", "anima_turbo"]
+        );
+        assert_eq!(
+            explicit_trainers,
+            ["anima_base", "anima_aesthetic", "anima_turbo"]
+        );
+    }
+
+    /// The shared weights-free behavior oracle: every registered contract, safety check, fixture and
+    /// request scope has to agree with the ladder each provider declares — including that a rung the
+    /// contract calls `Missing` cannot be begun, and that an admitted scope's lifecycle hooks accept
+    /// exactly the parameters it advertised.
+    #[test]
+    fn shared_ladder_registrations_pass_the_weights_free_behavior_oracle() {
+        let registry = super::provider_registry().unwrap();
+        for load_shape in [
+            mlx_gen::LoadShape::DeferredMaterialization,
+            mlx_gen::LoadShape::EagerMaterialization,
+        ] {
+            let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
+                .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+                .with_load_shape(load_shape);
+            gen_core_testkit::memory_strategy::memory_strategy_registry_conformance(
+                &registry, &spec,
+            );
+        }
+    }
+}

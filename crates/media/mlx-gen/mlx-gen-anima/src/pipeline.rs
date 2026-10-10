@@ -1,0 +1,1264 @@
+//! The end-to-end Anima txt2img pipeline: prompt → (Qwen3 encode → mask-multiply → conditioner) →
+//! DiT denoise (flow-match) → VAE decode → image. Transcribed from the diffusers Anima modular
+//! pipeline (`encoders.py` / `before_denoise.py` / `denoise.py` / `decoders.py`).
+
+use mlx_rs::ops::{add, multiply, subtract};
+use mlx_rs::{random, Array, Dtype};
+
+use mlx_gen::adapters::loader::ApplyReport;
+use mlx_gen::attention::AttentionPlan;
+use mlx_gen::image::decoded_to_image;
+use mlx_gen::media::Image;
+use mlx_gen::runtime::{AdapterSpec, CancelFlag};
+use mlx_gen::tiling::TilingConfig;
+use mlx_gen::{
+    resolve_flow_schedule, run_flow_sampler, Error, PreviewSink, Progress, Result, StagedHeavy,
+    TimestepConvention, WeightsSource,
+};
+
+use crate::block_stream::BlockWindow;
+use crate::conditioner::AnimaTextConditioner;
+use crate::config::{Variant, SIGMA_SHIFT, VAE_CHANNELS, VAE_COMPRESSION};
+use crate::loader::{load_heavy_phase_with_stream, load_text_phase, AnimaComponents};
+use crate::text_encoder::AnimaQwen3;
+use crate::tokenizer::AnimaTokenizers;
+use crate::transformer::CosmosDiT;
+use crate::vae::QwenVae;
+
+/// Anima's recommended default sampler (the ER-SDE-3 solver added for this epic, sc-10519). A request
+/// `sampler` overrides it; any curated flow solver (euler, dpmpp_2m, …) is valid.
+pub const DEFAULT_SAMPLER: &str = "er_sde";
+
+/// The Anima sigma schedule: `linspace(1.0, 1/N, N)` (**NOT** the diffusers default) time-shifted by
+/// the static `shift=3.0` (`3σ / (1 + 2σ)`), with the trailing terminal `0.0` the flow sampler
+/// integrates to. Length `N + 1`, descending.
+pub fn anima_sigmas(steps: usize) -> Vec<f32> {
+    let n = steps.max(1);
+    let shift = SIGMA_SHIFT as f64;
+    let mut sigmas: Vec<f32> = (0..n)
+        .map(|i| {
+            // linspace(1.0, 1/n, n)
+            let s = if n == 1 {
+                1.0
+            } else {
+                1.0 + (i as f64) * (1.0 / n as f64 - 1.0) / ((n - 1) as f64)
+            };
+            // static time-shift: shift·s / (1 + (shift−1)·s)
+            (shift * s / (1.0 + (shift - 1.0) * s)) as f32
+        })
+        .collect();
+    sigmas.push(0.0);
+    sigmas
+}
+
+/// Resolve the Anima σ schedule, honoring a per-generation curated `scheduler` name (epic 7114
+/// scheduler axis, sc-11123 / F-115). The engine advertises the full curated scheduler menu, so this
+/// threads `req.scheduler` into the σ-schedule construction instead of ignoring it:
+///
+/// - `None`, an unknown, or a native-aliased name (`linear` / `flow_match_euler`) returns
+///   [`anima_sigmas`] **byte-for-byte** — the N1 default-parity guarantee (never hard-fail a
+///   generation over a scheduling knob; the shared floor already rejects any non-curated name).
+/// - A curated name (`karras` / `simple` / `beta` / `beta57` / …) re-shapes σ over the SAME static
+///   `shift=3.0` (`mu = ln(3)`), so a schedule stays consistent with Anima's time-shift rather than
+///   degrading to a linear σ ramp. The scheduler picks WHERE the steps land; `req.sampler` still picks
+///   the integrator.
+pub fn anima_schedule(scheduler: Option<&str>, steps: usize) -> Vec<f32> {
+    let native = anima_sigmas(steps);
+    resolve_flow_schedule(scheduler, SIGMA_SHIFT.ln(), steps, &native)
+}
+
+/// Seeded initial latent noise `[1, 16, 1, H/8, W/8]` (f32 standard normal), the 5-D Cosmos latent.
+fn create_noise(seed: u64, width: u32, height: u32) -> Result<Array> {
+    let key = random::key(seed)?;
+    let shape = [
+        1,
+        VAE_CHANNELS as i32,
+        1,
+        (height / VAE_COMPRESSION) as i32,
+        (width / VAE_COMPRESSION) as i32,
+    ];
+    Ok(random::normal::<f32>(&shape[..], None, None, Some(&key))?)
+}
+
+/// Per-generation options.
+pub struct GenOptions {
+    pub width: u32,
+    pub height: u32,
+    pub steps: usize,
+    pub guidance: f32,
+    pub seed: u64,
+    /// Curated sampler name; `None` ⇒ [`DEFAULT_SAMPLER`].
+    pub sampler: Option<String>,
+    /// Curated scheduler name (epic 7114 scheduler axis); `None` ⇒ the native [`anima_sigmas`]
+    /// schedule. Resolved via [`anima_schedule`].
+    pub scheduler: Option<String>,
+}
+
+/// The assembled Anima pipeline.
+pub struct AnimaPipeline {
+    components: AnimaComponents,
+}
+
+impl AnimaPipeline {
+    pub fn from_source(source: &WeightsSource, variant: Variant) -> Result<Self> {
+        Ok(Self {
+            components: AnimaComponents::load(source, variant)?,
+        })
+    }
+
+    pub fn components(&self) -> &AnimaComponents {
+        &self.components
+    }
+
+    /// Bake LoRA/LoKr adapters onto the DiT **and** the bundled `AnimaTextConditioner` at load time
+    /// (sc-10521). Stacked + mixed LoRA/LoKr are supported by construction; an unmatched target is a
+    /// hard error (strict). No-op for an empty spec list. Returns the [`ApplyReport`] (its `applied`
+    /// count is 508 for the turbo LoRA — 448 DiT + 60 conditioner — and 448 for the DiT-only style
+    /// LoRA). Applied on the still-mutable model during `load`, mirroring the Z-Image/Qwen seam.
+    pub fn apply_adapters(&mut self, specs: &[AdapterSpec]) -> Result<ApplyReport> {
+        crate::adapters::apply_anima_adapters(
+            &mut self.components.dit,
+            &mut self.components.conditioner,
+            specs,
+        )
+    }
+
+    /// Encode a prompt to the DiT's `encoder_hidden_states` `[1, 512, 1024]` (bf16): Qwen3
+    /// `last_hidden_state` → **mask-multiply** (VERIFIED trap) → `AnimaTextConditioner`.
+    ///
+    /// ComfyUI-style `(text:weight)` emphasis (sc-10566) applies to the **T5 query-token path only**:
+    /// the Qwen tower is tokenized on the de-weighted text (its token weights are forced to `1.0`),
+    /// while the parsed per-token weights scale the conditioner output. See [`crate::prompt_weight`].
+    pub fn encode_prompt(&self, prompt: &str) -> Result<Array> {
+        self.encode_prompt_with(
+            prompt,
+            &self.components.text_encoder,
+            &self.components.conditioner,
+        )
+    }
+
+    /// [`encode_prompt`](Self::encode_prompt) with an EXPLICIT text-encoder + conditioner pair, so a
+    /// caller can encode with the resident **bf16** modules or an **fp32-upcast reference** pair from
+    /// [`crate::loader::load_conditioning_at_dtype`] (sc-10577). The conditioning dtype is whatever `te`
+    /// produces (its `compute_dtype`), threaded into the conditioner — so `te` and `cond` MUST share a
+    /// dtype (both bf16, the shipped default, or both fp32). With the resident bf16 modules this is
+    /// byte-identical to the pre-sc-10577 `encode_prompt`.
+    pub fn encode_prompt_with(
+        &self,
+        prompt: &str,
+        te: &AnimaQwen3,
+        cond: &AnimaTextConditioner,
+    ) -> Result<Array> {
+        let c = &self.components;
+        // Qwen is weight-blind: strip the emphasis syntax to plain text before tokenizing (a no-op for
+        // an unweighted prompt). This mirrors ComfyUI forcing the Qwen token weights to 1.0.
+        let qwen_text = crate::prompt_weight::strip_prompt_weights(prompt);
+        let (qwen_ids, qwen_mask) = c.tokenizers.encode_qwen(&qwen_text)?;
+        let source = te.forward(&qwen_ids, &qwen_mask)?; // [1, S, 1024] in te.compute_dtype
+                                                         // Multiply the Qwen states by the attention mask BEFORE the conditioner (zeros padded/uncond
+                                                         // tokens) — the flagged trap. Batch-1 real prompts have an all-ones mask (no-op); the empty
+                                                         // uncond prompt's single token (mask 0) is zeroed so the conditioner cross-attn contributes 0.
+        let mask = qwen_mask.as_dtype(source.dtype())?.expand_dims(2)?; // [1, S, 1]
+        let source = multiply(&source, &mask)?;
+        // T5 carries the per-token weights (all 1.0 ⇒ strict no-op equal to the unweighted path).
+        let (t5_ids, t5_weights) = c.tokenizers.encode_t5_weighted(prompt)?; // [1, St], len St
+        cond.forward_weighted(&source, &t5_ids, Some(&t5_weights), source.dtype())
+    }
+
+    /// Generate one image. `negative` is used only when `variant.uses_cfg()`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate(
+        &self,
+        prompt: &str,
+        negative: &str,
+        variant: Variant,
+        opts: &GenOptions,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let noise = create_noise(opts.seed, opts.width, opts.height)?;
+        let sampler = opts.sampler.as_deref().unwrap_or(DEFAULT_SAMPLER);
+        // VAE decode (applies the baked latents_mean/std de-norm) → [1, 3, 1, H, W] f32 in [-1, 1].
+        let latent = self.denoise(
+            &noise,
+            prompt,
+            negative,
+            variant,
+            opts.steps,
+            opts.guidance,
+            sampler,
+            opts.scheduler.as_deref(),
+            opts.seed,
+            Dtype::Bfloat16,
+            cancel,
+            on_progress,
+        )?;
+        let decoded = self.components.vae.decode(&latent)?;
+        decoded_to_image(&decoded)
+    }
+
+    /// The flow denoise loop shared by [`generate`](Self::generate) and the stage-7 parity hook. Encodes
+    /// the prompt (+ negative for CFG variants), then runs `sampler` over [`anima_sigmas`] from the given
+    /// `init` latent, evaluating the DiT in `dtype`. Returns the final latent `[1, 16, 1, H/8, W/8]`
+    /// (f32, pre-VAE). The DiT is a **standard flow denoiser**: it predicts `v ≈ ε − x0` and embeds the
+    /// **raw σ** as its timestep, so the sampler (`TimestepConvention::Sigma`, `x + (σ_next − σ)·v`)
+    /// consumes it directly — no negation, no `1 − σ` timestep.
+    #[allow(clippy::too_many_arguments)]
+    fn denoise(
+        &self,
+        init: &Array,
+        prompt: &str,
+        negative: &str,
+        variant: Variant,
+        steps: usize,
+        guidance: f32,
+        sampler: &str,
+        scheduler: Option<&str>,
+        seed: u64,
+        dtype: Dtype,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        let cond = self.encode_prompt(prompt)?;
+        let uncond = if variant.uses_cfg() {
+            Some(self.encode_prompt(negative)?)
+        } else {
+            None
+        };
+        denoise_loop(
+            &self.components.dit,
+            init,
+            &cond,
+            uncond.as_ref(),
+            steps,
+            guidance,
+            sampler,
+            scheduler,
+            seed,
+            dtype,
+            &PreviewSink::default(),
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// Test hook (sc-10577 isolation measurement): the deterministic stage-7 denoise from an **injected**
+    /// latent using ALREADY-COMPUTED conditioning `cond` (+ `uncond` for CFG variants), so the caller
+    /// feeds either the resident bf16 conditioning or an fp32-upcast reference through the identical
+    /// injected-init + Euler + schedule trajectory. The DiT runs in `dit_dtype` (fp32 for the stage-7
+    /// golden). The delta between the two runs' final latents IS the bf16-conditioning contribution.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_from_latent_with_conditioning(
+        &self,
+        init: &Array,
+        cond: &Array,
+        uncond: Option<&Array>,
+        steps: usize,
+        guidance: f32,
+        sampler: &str,
+        dit_dtype: Dtype,
+    ) -> Result<Array> {
+        let cancel = CancelFlag::default();
+        let mut prog = |_p: Progress| {};
+        // Parity hook: native schedule (scheduler = None) so the injected-init trajectory is byte-exact.
+        denoise_loop(
+            &self.components.dit,
+            init,
+            cond,
+            uncond,
+            steps,
+            guidance,
+            sampler,
+            None,
+            0,
+            dit_dtype,
+            &PreviewSink::default(),
+            &cancel,
+            &mut prog,
+        )
+    }
+
+    /// Test hook (sc-10524 stage-7 golden): run the flow denoise from an **injected** initial latent
+    /// (instead of sampling noise) with an explicit `sampler`/`dtype`, returning the final latent
+    /// `[1, 16, 1, H/8, W/8]` (pre-VAE). Lets an MLX-vs-diffusers end-to-end comparison feed BOTH sides
+    /// the identical starting point + a deterministic solver, so residual drift is float error, not the
+    /// chaos of two independently-sampled noises.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_from_latent(
+        &self,
+        init: &Array,
+        prompt: &str,
+        negative: &str,
+        variant: Variant,
+        steps: usize,
+        guidance: f32,
+        sampler: &str,
+        dtype: Dtype,
+    ) -> Result<Array> {
+        let cancel = CancelFlag::default();
+        let mut prog = |_p: Progress| {};
+        // Parity hook: native schedule (scheduler = None) so the injected-init trajectory is byte-exact.
+        self.denoise(
+            init, prompt, negative, variant, steps, guidance, sampler, None, 0, dtype, &cancel,
+            &mut prog,
+        )
+    }
+
+    /// Test hook (sc-10524 stage-7 golden, intermediate-latent capture): run the same deterministic
+    /// denoise as [`denoise_from_latent`], additionally snapshotting the latent AFTER each step count in
+    /// `capture_after` (`x_k` = the state after `k` Euler steps). Returns `(final_latent, [(k, x_k)])`.
+    ///
+    /// `x_k` is exactly the input the `(k+1)`-th DiT call sees (the sampler calls `predict(x_k, σ_k)` at
+    /// step `k`), so it matches the Python generator's `caps[k]` bit-for-bit in definition. Comparing the
+    /// per-step deltas lets the parity test distinguish a systematic BIAS (the MLX bf16-conditioning lock —
+    /// present from step 1) from diffuse float ACCUMULATION (grows with step count).
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_from_latent_capture(
+        &self,
+        init: &Array,
+        prompt: &str,
+        negative: &str,
+        variant: Variant,
+        steps: usize,
+        guidance: f32,
+        sampler: &str,
+        dtype: Dtype,
+        capture_after: &[usize],
+    ) -> Result<(Array, Vec<(usize, Array)>)> {
+        let cancel = CancelFlag::default();
+        let mut prog = |_p: Progress| {};
+        let cond = self.encode_prompt(prompt)?;
+        let uncond = if variant.uses_cfg() {
+            Some(self.encode_prompt(negative)?)
+        } else {
+            None
+        };
+        let sigmas = anima_sigmas(steps);
+        let guidance = Array::from_slice(&[guidance], &[1]);
+        let dit = &self.components.dit;
+        let want: std::collections::HashSet<usize> = capture_after.iter().copied().collect();
+        let call = std::cell::Cell::new(0usize);
+        let captures: std::cell::RefCell<Vec<(usize, Array)>> = std::cell::RefCell::new(Vec::new());
+        let predict = |x: &Array, sigma: f32| -> Result<Array> {
+            // The sampler calls predict(x_k, σ_k) at step k, so `x` here is the state after k steps.
+            let k = call.get();
+            if want.contains(&k) {
+                let snap = x.as_dtype(Dtype::Float32)?;
+                mlx_rs::transforms::eval([&snap])?;
+                captures.borrow_mut().push((k, snap));
+            }
+            call.set(k + 1);
+            let s = Array::from_slice(&[sigma], &[1]);
+            let v_cond = dit.forward(x, &s, &cond, dtype)?;
+            let v = match &uncond {
+                Some(u) => {
+                    let v_u = dit.forward(x, &s, u, dtype)?;
+                    add(&v_u, &multiply(&subtract(&v_cond, &v_u)?, &guidance)?)?
+                }
+                None => v_cond,
+            };
+            Ok(v.as_dtype(Dtype::Float32)?)
+        };
+        let final_latent = run_flow_sampler(
+            Some(sampler),
+            TimestepConvention::Sigma,
+            &sigmas,
+            init.clone(),
+            0,
+            &cancel,
+            &mut prog,
+            predict,
+        )?;
+        Ok((final_latent, captures.into_inner()))
+    }
+}
+
+/// One inference denoise trajectory's preview state. Anima owns schedule cadence; Qwen owns the
+/// single-frame layout conversion and latent-to-RGB fit because both families use the same VAE.
+struct AnimaPreview<'a> {
+    sink: &'a PreviewSink,
+    counter: mlx_gen::preview::PreviewCounter,
+    sigmas: &'a [f32],
+}
+
+impl<'a> AnimaPreview<'a> {
+    fn new(sink: &'a PreviewSink, sigmas: &'a [f32]) -> Self {
+        Self {
+            sink,
+            counter: mlx_gen::preview::PreviewCounter::new(sigmas),
+            sigmas,
+        }
+    }
+
+    fn emit(&self, sigma: f32, latents: &Array) {
+        mlx_gen_qwen_image::preview::emit_single_frame_preview(
+            self.sink,
+            &self.counter,
+            self.sigmas,
+            sigma,
+            latents,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_anima_sampler<F>(
+    sampler: Option<&str>,
+    sigmas: &[f32],
+    latents: Array,
+    seed: u64,
+    cancel: &CancelFlag,
+    preview: &AnimaPreview<'_>,
+    on_progress: &mut dyn FnMut(Progress),
+    mut predict: F,
+) -> Result<Array>
+where
+    F: FnMut(&Array, f32) -> Result<Array>,
+{
+    run_flow_sampler(
+        sampler,
+        TimestepConvention::Sigma,
+        sigmas,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        |x, timestep| {
+            preview.emit(timestep, x);
+            predict(x, timestep)
+        },
+    )
+}
+
+/// The core flow-denoise loop given ALREADY-COMPUTED conditioning (sc-10577 decoupling; hoisted to a
+/// free fn over the DiT in sc-10840 so the resident struct API AND the staged-residency generator share
+/// one integrator): run `sampler` over [`anima_schedule`] from `init`, evaluating `dit` in `dit_dtype`,
+/// with CFG when `uncond` is `Some`. Byte-identical to the pre-hoist method — it took `&self` only to
+/// reach `self.components.dit`. `preview` is advisory and cannot fail the denoise.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_loop(
+    dit: &CosmosDiT,
+    init: &Array,
+    cond: &Array,
+    uncond: Option<&Array>,
+    steps: usize,
+    guidance: f32,
+    sampler: &str,
+    scheduler: Option<&str>,
+    seed: u64,
+    dit_dtype: Dtype,
+    preview: &PreviewSink,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    denoise_loop_bounded(
+        dit,
+        init,
+        cond,
+        uncond,
+        steps,
+        guidance,
+        sampler,
+        scheduler,
+        seed,
+        dit_dtype,
+        preview,
+        cancel,
+        on_progress,
+        AttentionPlan::UNBOUNDED,
+        None,
+    )
+}
+
+/// [`denoise_loop`] under the request's memory plan — ladder rungs 3 and 4 (SC-15524).
+///
+/// `attention` and `window` reach **every** advertised denoise route: the plain Turbo single forward
+/// and BOTH forwards of the Base/Aesthetic CFG pair. Neither changes precision, seed, σ schedule,
+/// sampler or conditioning; `UNBOUNDED` + `None` is byte-for-byte [`denoise_loop`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_loop_bounded(
+    dit: &CosmosDiT,
+    init: &Array,
+    cond: &Array,
+    uncond: Option<&Array>,
+    steps: usize,
+    guidance: f32,
+    sampler: &str,
+    scheduler: Option<&str>,
+    seed: u64,
+    dit_dtype: Dtype,
+    preview: &PreviewSink,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    attention: AttentionPlan<'_>,
+    window: Option<BlockWindow<'_>>,
+) -> Result<Array> {
+    let sigmas = anima_schedule(scheduler, steps);
+    let previews = AnimaPreview::new(preview, &sigmas);
+    let guidance = Array::from_slice(&[guidance], &[1]);
+    let predict = |x: &Array, sigma: f32| -> Result<Array> {
+        let s = Array::from_slice(&[sigma], &[1]);
+        let v_cond = dit.forward_bounded(x, &s, cond, dit_dtype, attention, window)?;
+        let v = match uncond {
+            // CFG: v = v_uncond + guidance·(v_cond − v_uncond).
+            Some(u) => {
+                let v_u = dit.forward_bounded(x, &s, u, dit_dtype, attention, window)?;
+                add(&v_u, &multiply(&subtract(&v_cond, &v_u)?, &guidance)?)?
+            }
+            None => v_cond,
+        };
+        // Integrate in f32 (the reference keeps latents f32).
+        Ok(v.as_dtype(Dtype::Float32)?)
+    };
+    run_anima_sampler(
+        Some(sampler),
+        &sigmas,
+        init.clone(),
+        seed,
+        cancel,
+        &previews,
+        on_progress,
+        predict,
+    )
+}
+
+// ==================================================================================================
+// Component-residency phases (epic 10834, sc-10840)
+// ==================================================================================================
+//
+// The staged split for `OffloadPolicy::Sequential` (the shared `mlx_gen::Residency` seam): the Qwen3
+// text encoder is the phase-A component dropped first, and the DiT + bundled conditioner + VAE are the
+// heavy render bundle. The seam between them is the conditioner's INPUTS — the masked Qwen3 states +
+// the T5 query ids/weights — exactly the seam the trainer already caches to keep the conditioner
+// adapters live (`render_preview`). The two free helpers below ([`encode_conditioner_inputs`] +
+// [`conditioner_forward`]) ARE the two halves of [`AnimaPipeline::encode_prompt_with`], so the resident
+// struct API and the staged generator produce byte-identical conditioning.
+
+/// Phase A of the encode (sc-10840): tokenize + Qwen3 forward + mask-multiply → the conditioner's
+/// INPUTS. This is the first half of [`AnimaPipeline::encode_prompt_with`] — everything the Qwen3 TE
+/// touches — so it can run while the TE is alive, its output materialized, and the TE dropped before
+/// the conditioner (heavy phase) consumes it. The T5 ids/weights come from the tokenizers (also
+/// phase-A), not the TE.
+fn encode_conditioner_inputs(
+    te: &AnimaQwen3,
+    tokenizers: &AnimaTokenizers,
+    prompt: &str,
+) -> Result<AnimaCondInputs> {
+    // Qwen is weight-blind: strip the emphasis syntax to plain text before tokenizing (a no-op for an
+    // unweighted prompt). This mirrors ComfyUI forcing the Qwen token weights to 1.0.
+    let qwen_text = crate::prompt_weight::strip_prompt_weights(prompt);
+    let (qwen_ids, qwen_mask) = tokenizers.encode_qwen(&qwen_text)?;
+    let source = te.forward(&qwen_ids, &qwen_mask)?; // [1, S, 1024] in te.compute_dtype
+                                                     // Mask-multiply BEFORE the conditioner (the flagged trap): zero padded/uncond tokens.
+    let mask = qwen_mask.as_dtype(source.dtype())?.expand_dims(2)?; // [1, S, 1]
+    let source = multiply(&source, &mask)?;
+    // T5 carries the per-token weights (all 1.0 ⇒ strict no-op equal to the unweighted path).
+    let (t5_ids, t5_weights) = tokenizers.encode_t5_weighted(prompt)?;
+    Ok(AnimaCondInputs {
+        source,
+        t5_ids,
+        t5_weights,
+    })
+}
+
+/// Phase B of the encode (sc-10840): the `AnimaTextConditioner` forward over the phase-A inputs →
+/// `encoder_hidden_states` `[1, 512, 1024]`. The second half of
+/// [`AnimaPipeline::encode_prompt_with`]; the conditioner runs in the inputs' own `source` dtype
+/// (bf16 production / fp32 reference), so this is byte-identical to the pre-split path.
+fn conditioner_forward(cond: &AnimaTextConditioner, inp: &AnimaCondInputs) -> Result<Array> {
+    cond.forward_weighted(
+        &inp.source,
+        &inp.t5_ids,
+        Some(&inp.t5_weights),
+        inp.source.dtype(),
+    )
+}
+
+/// The conditioner's INPUTS produced by phase A (sc-10840) — materializable before the Qwen3 TE is
+/// dropped under `Sequential`: the masked Qwen3 `source` states `[1, S, 1024]`, the T5 query ids
+/// `[1, St]`, and the per-token T5 weights (host data). The heavy phase's `conditioner_forward`
+/// consumes these.
+pub struct AnimaCondInputs {
+    /// Masked Qwen3 states `[1, S, 1024]`, in the TE's compute dtype (bf16 production).
+    pub source: Array,
+    /// T5 query token ids `[1, St]` (int32).
+    pub t5_ids: Array,
+    /// Per-T5-token ComfyUI weights (all `1.0` for an unweighted prompt); host data, no eval needed.
+    pub t5_weights: Vec<f32>,
+}
+
+/// The phase-A **text-encode** component (sc-10840): the Qwen3-0.6B TE + tokenizers, dropped first
+/// under `OffloadPolicy::Sequential`. Encodes to the conditioner INPUTS; the conditioner itself lives
+/// on [`AnimaHeavy`] (it is bundled in the DiT checkpoint), so dropping this frees the Qwen3 tower
+/// before the DiT loads.
+pub struct AnimaText {
+    text_encoder: AnimaQwen3,
+    tokenizers: AnimaTokenizers,
+}
+
+impl AnimaText {
+    /// Load the Qwen3 TE + tokenizers (the `text_encoders/` file), via the shared
+    /// [`load_text_phase`] the resident `AnimaComponents::load` also uses.
+    pub fn load(source: &WeightsSource, variant: Variant) -> Result<Self> {
+        let (text_encoder, tokenizers) = load_text_phase(source, variant)?;
+        Ok(Self {
+            text_encoder,
+            tokenizers,
+        })
+    }
+
+    /// Encode one prompt to the conditioner's INPUTS (phase A). Deterministic (draws no RNG), so
+    /// hoisting it out of the per-image count loop is byte-identical to the pre-sc-10840 per-image
+    /// re-encode.
+    pub fn encode_inputs(&self, prompt: &str) -> Result<AnimaCondInputs> {
+        encode_conditioner_inputs(&self.text_encoder, &self.tokenizers, prompt)
+    }
+}
+
+/// The phase-B **heavy render** bundle (sc-10840): the Cosmos DiT, the bundled `AnimaTextConditioner`,
+/// and the Qwen-Image VAE. Held after the Qwen3 TE is dropped under `Sequential`; the identical
+/// [`render_one`](AnimaHeavy::render_one) body runs for both residencies, so a `Sequential` job is
+/// byte-identical to `Resident`. Keeping the conditioner here (checkpoint-bundled with the DiT) lets
+/// [`apply_adapters`](AnimaHeavy::apply_adapters) strict-apply DiT and conditioner targets in one pass.
+pub struct AnimaHeavy {
+    dit: CosmosDiT,
+    conditioner: AnimaTextConditioner,
+    vae: QwenVae,
+}
+
+impl AnimaHeavy {
+    /// Load the DiT + bundled conditioner (`diffusion_models/`) + VAE (`vae/`), via the shared
+    /// [`load_heavy_phase`](crate::loader::load_heavy_phase) the resident `AnimaComponents::load`
+    /// also uses.
+    pub fn load(source: &WeightsSource, variant: Variant) -> Result<Self> {
+        Self::load_with_stream(source, variant, false)
+    }
+
+    /// [`load`](Self::load) in the component form this request selected (SC-15524). `streamable`
+    /// arms ladder rung 4 on the DiT; every other component is loaded identically.
+    pub fn load_with_stream(
+        source: &WeightsSource,
+        variant: Variant,
+        streamable: bool,
+    ) -> Result<Self> {
+        let (dit, conditioner, vae) = load_heavy_phase_with_stream(source, variant, streamable)?;
+        Ok(Self {
+            dit,
+            conditioner,
+            vae,
+        })
+    }
+
+    /// Whether ladder rung 4 can execute on this bundle.
+    pub fn can_stream_blocks(&self) -> bool {
+        self.dit.can_stream_blocks()
+    }
+
+    /// Bake LoRA/LoKr adapters onto the DiT **and** the bundled conditioner in one strict pass
+    /// (sc-10521 / sc-10274). Both live on this bundle, so the whole spec — `blocks.*` (DiT) +
+    /// `llm_adapter.*` (conditioner) — is validated together and a span-both LoRA can't load partial.
+    ///
+    /// The per-block adapter capture for rung 4 happens HERE, immediately after the strict install,
+    /// so a streamed block replays exactly what the resident block ended up holding. Doing it any
+    /// later would leave a window at which a rung-4 render silently drops every LoRA — identity-free
+    /// output with no error (the `anima-turbo-lora-v0.2` 508-target failure mode).
+    pub fn apply_adapters(&mut self, specs: &[AdapterSpec]) -> Result<ApplyReport> {
+        let report =
+            crate::adapters::apply_anima_adapters(&mut self.dit, &mut self.conditioner, specs)?;
+        self.dit.capture_block_adapters();
+        Ok(report)
+    }
+
+    /// Plan a rung-4 block window for this request, or `None` for the resident stack. A window
+    /// requested on a bundle that cannot stream is a typed error, never a silent resident execution.
+    pub(crate) fn block_window<'a>(
+        &self,
+        window_size: Option<usize>,
+        cancel: &'a CancelFlag,
+    ) -> Result<Option<BlockWindow<'a>>> {
+        self.dit.block_window(window_size, cancel)
+    }
+
+    /// Run the conditioner forward over the phase-A inputs → `encoder_hidden_states` `[1, 512, 1024]`.
+    /// Seed-independent, so the generator runs it once (per cond/uncond) before the count loop.
+    pub fn conditioner_forward(&self, inp: &AnimaCondInputs) -> Result<Array> {
+        conditioner_forward(&self.conditioner, inp)
+    }
+
+    /// Render one image from PRE-COMPUTED conditioner outputs (sc-10840): seed → noise → flow denoise
+    /// (`dit`, bf16) → VAE decode → RGB. The single render body shared by both residencies — the same
+    /// `denoise_loop` + decode the resident `AnimaPipeline::generate` runs, so a `Sequential` job
+    /// (Qwen3 TE already dropped) is byte-identical to `Resident`. `cond`/`uncond` are the conditioner
+    /// outputs (not inputs); `uncond` is `Some` only for CFG variants.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_one(
+        &self,
+        cond: &Array,
+        uncond: Option<&Array>,
+        width: u32,
+        height: u32,
+        steps: usize,
+        guidance: f32,
+        sampler: &str,
+        scheduler: Option<&str>,
+        seed: u64,
+        preview: &PreviewSink,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let latent = self.denoise_one(
+            cond,
+            uncond,
+            width,
+            height,
+            steps,
+            guidance,
+            sampler,
+            scheduler,
+            seed,
+            preview,
+            cancel,
+            on_progress,
+            AttentionPlan::UNBOUNDED,
+            None,
+        )?;
+        on_progress(Progress::Decoding);
+        self.decode_view().decode_one(&latent, cancel, None)
+    }
+
+    /// Calibration seam (SC-15524): [`denoise_one`](Self::denoise_one) at an explicit rung-3/rung-4
+    /// execution shape, with the block window taken **raw** rather than through the published
+    /// domain.
+    ///
+    /// The split is deliberate and is the same one rung 2 already has:
+    /// [`crate::memory_strategy::transformer_window_size`] owns the *policy* (which cadences this
+    /// family measured and will execute) and the production path refuses everything outside it,
+    /// while this is the *mechanism* — the exact analogue of `QwenVae::decode_tiled` accepting any
+    /// `TilingConfig` so the decode sweep can measure the edges it then rejects.
+    ///
+    /// It exists so `transformer_window_sweep_shows_the_published_domain_is_exact` can MEASURE the
+    /// unpublished cadences (including the all-covering control that bounds nothing) instead of
+    /// asserting the domain it is supposed to be deriving. Nothing in production calls it: a request
+    /// cannot reach it, because it takes a `usize` and not a `GenerationRequest`.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn calibration_denoise_one(
+        &self,
+        cond: &Array,
+        uncond: Option<&Array>,
+        width: u32,
+        height: u32,
+        steps: usize,
+        guidance: f32,
+        sampler: &str,
+        seed: u64,
+        chunk_attention: bool,
+        window_size: Option<usize>,
+        cancel: &CancelFlag,
+    ) -> Result<Array> {
+        let attention = if chunk_attention {
+            AttentionPlan::budgeted(mlx_gen::attention::AttentionBudget::CONSTRAINED)
+                .with_cancel(cancel)
+        } else {
+            AttentionPlan::UNBOUNDED
+        };
+        let window = self.block_window(window_size, cancel)?;
+        self.denoise_one(
+            cond,
+            uncond,
+            width,
+            height,
+            steps,
+            guidance,
+            sampler,
+            None,
+            seed,
+            &PreviewSink::default(),
+            cancel,
+            &mut |_| {},
+            attention,
+            window,
+        )
+    }
+
+    /// The denoise half of [`render_one`] — seed → noise → flow denoise (`dit`, bf16) → latent.
+    ///
+    /// Split out for ladder rung 1: the staged schedule materializes every latent while the DiT is
+    /// alive, sheds the DiT + conditioner, and only then decodes. `attention`/`window` carry rungs 3
+    /// and 4; `UNBOUNDED` + `None` reproduces the historical trajectory exactly.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn denoise_one(
+        &self,
+        cond: &Array,
+        uncond: Option<&Array>,
+        width: u32,
+        height: u32,
+        steps: usize,
+        guidance: f32,
+        sampler: &str,
+        scheduler: Option<&str>,
+        seed: u64,
+        preview: &PreviewSink,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        attention: AttentionPlan<'_>,
+        window: Option<BlockWindow<'_>>,
+    ) -> Result<Array> {
+        let noise = create_noise(seed, width, height)?;
+        denoise_loop_bounded(
+            &self.dit,
+            &noise,
+            cond,
+            uncond,
+            steps,
+            guidance,
+            sampler,
+            scheduler,
+            seed,
+            Dtype::Bfloat16,
+            preview,
+            cancel,
+            on_progress,
+            attention,
+            window,
+        )
+    }
+}
+
+/// What survives ladder rung 1's denoise→decode boundary: the ~250 MB Qwen-Image VAE. The DiT and the
+/// bundled conditioner — the 4.18 GB the request is actually bound by — are dropped.
+pub struct AnimaLight {
+    vae: QwenVae,
+}
+
+/// A borrow of whichever VAE the decode phase should use: the warm bundle's (Resident) or the shed
+/// bundle's (staged). One decode body serves both, so a staged request is byte-identical to a warm one.
+pub struct AnimaDecodeView<'a> {
+    vae: &'a QwenVae,
+}
+
+impl AnimaDecodeView<'_> {
+    /// Decode one `[1, 16, 1, H/8, W/8]` latent to RGB, optionally through the bounded (tiled) VAE
+    /// path — ladder rung 2. The tiled decode preserves the exact output geometry: the shared
+    /// `mlx_gen::vae_tiling` accumulator blends `scale×` tile slabs into the same `H×W` buffer the
+    /// single-pass decode writes.
+    ///
+    /// **Both arms honor `cancel`, and the untiled one has exactly one place it can.** MLX is lazy:
+    /// `vae.decode` only *builds* the graph, and `decoded_to_image`'s `as_slice` readback is what
+    /// forces the whole single-pass decode — the most expensive uninterruptible span in the request.
+    /// There is no interior boundary to poll inside it (that is what rung 2's per-tile check buys),
+    /// so the honest guarantee is per-latent: a cancel observed before this decode starts aborts
+    /// here rather than after the readback. Rung 1 made that matter — decodes moved from
+    /// interleaved-with-denoise to a trailing batch, so a `count = 8` render has eight of these in a
+    /// row and the phase-C loop re-checks before each one.
+    pub fn decode_one(
+        &self,
+        latent: &Array,
+        cancel: &CancelFlag,
+        tiling: Option<&TilingConfig>,
+    ) -> Result<Image> {
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let decoded = match tiling {
+            Some(tiling) => self.vae.decode_tiled(latent, tiling, Some(cancel))?,
+            None => self.vae.decode(latent)?,
+        }; // [1, 3, 1, H, W] f32 in [-1, 1]
+        decoded_to_image(&decoded)
+    }
+}
+
+impl StagedHeavy for AnimaHeavy {
+    type Light = AnimaLight;
+    type DecodeView<'a> = AnimaDecodeView<'a>;
+
+    fn shed_dit(self) -> AnimaLight {
+        AnimaLight { vae: self.vae }
+    }
+
+    fn decode_view(&self) -> AnimaDecodeView<'_> {
+        AnimaDecodeView { vae: &self.vae }
+    }
+
+    fn light_view(light: &AnimaLight) -> AnimaDecodeView<'_> {
+        AnimaDecodeView { vae: &light.vae }
+    }
+}
+
+// ==================================================================================================
+// In-training preview sampling (sc-10641)
+// ==================================================================================================
+//
+// The trainer renders a periodic preview from the IN-PROGRESS adapter so the user can watch the LoRA
+// converge (the sc-5637 `TrainingProgress::Sample` contract). Unlike z-image (one DiT host), an Anima
+// preview MUST run the conditioner (`llm_adapter`) forward through the LIVE graph: its 60 adapter
+// targets are trained, so reusing a cached conditioner OUTPUT would render a model whose conditioner
+// adapters are silently inert — the exact sc-10522 trap. The trainer therefore caches the conditioner
+// INPUTS (masked Qwen3 states + T5 ids) and calls [`render_preview`], which re-runs the conditioner
+// (with the current adapters installed) every preview. These helpers are forward-only (no gradients)
+// and mirror the inference denoise ([`AnimaPipeline::denoise`]): [`anima_sigmas`] + [`run_flow_sampler`]
+// over [`TimestepConvention::Sigma`], CFG-combining a live uncond conditioner forward on CFG variants.
+
+/// Render one preview image from the in-training adapter (sc-10641): run the (live) conditioner, denoise
+/// the DiT from seeded noise, VAE-decode → RGB. `source`/`t5_ids` are the cached conditioner inputs for
+/// the positive prompt; `uncond` is the cached empty-prompt inputs (CFG variants only). Forward-only.
+///
+/// The conditioner forward here is the sc-10522 correctness point: the DiT + conditioner adapters must
+/// already be installed on `dit`/`conditioner` (the trainer re-installs the current factors before each
+/// cadence), so this reflects the conditioner adapters' training — it is NOT a cached output.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_preview(
+    dit: &CosmosDiT,
+    conditioner: &AnimaTextConditioner,
+    vae: &QwenVae,
+    source: &Array,
+    t5_ids: &Array,
+    uncond: Option<&(Array, Array)>,
+    steps: usize,
+    guidance: f32,
+    edge: u32,
+    seed: u64,
+    dtype: Dtype,
+    cancel: &CancelFlag,
+) -> Result<Image> {
+    let init = create_noise(seed, edge, edge)?;
+    let latent = render_preview_latent(
+        dit,
+        conditioner,
+        source,
+        t5_ids,
+        uncond,
+        &init,
+        steps,
+        guidance,
+        seed,
+        dtype,
+        cancel,
+    )?;
+    // F-117: honor a cancel that arrived during the preview denoise before the (lazy) VAE decode.
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    let decoded = vae.decode(&latent)?; // [1, 3, 1, H, W] f32 in [-1, 1]
+    decoded_to_image(&decoded)
+}
+
+/// The VAE-free core of [`render_preview`]: run the LIVE conditioner (positive + optional uncond) then
+/// denoise the DiT from `init`, returning the final latent `[1, 16, 1, H/8, W/8]`. Split out so a
+/// weights-free (no-VAE) test can drive the exact production path and prove the conditioner is live —
+/// if this ever regressed to a cached conditioner output, the latent would stop responding to the
+/// conditioner adapters (the sc-10522 trap) and the guard test reddens.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_preview_latent(
+    dit: &CosmosDiT,
+    conditioner: &AnimaTextConditioner,
+    source: &Array,
+    t5_ids: &Array,
+    uncond: Option<&(Array, Array)>,
+    init: &Array,
+    steps: usize,
+    guidance: f32,
+    seed: u64,
+    dtype: Dtype,
+    cancel: &CancelFlag,
+) -> Result<Array> {
+    // LIVE conditioner forward — reflects the in-training `llm_adapter` adapters (sc-10522).
+    let cond = conditioner.forward(source, t5_ids, dtype)?;
+    // CFG (base/aesthetic): a live uncond conditioner forward too. Skipped at guidance 1.0 (the
+    // combination collapses to the positive forward) and for guidance-free variants (uncond == None).
+    let uncond_enc = match uncond {
+        Some((s, ids)) if guidance != 1.0 => Some(conditioner.forward(s, ids, dtype)?),
+        _ => None,
+    };
+    render_latent_with_enc(
+        dit,
+        &cond,
+        uncond_enc.as_ref(),
+        init,
+        steps,
+        guidance,
+        seed,
+        dtype,
+        cancel,
+    )
+}
+
+/// Denoise the DiT from `init` over [`anima_sigmas`] using a PRE-COMPUTED conditioner output `cond`
+/// (+ optional `uncond_enc` for CFG). The sampling half of [`render_preview_latent`], factored so the
+/// live path and the guard test share one integrator and differ ONLY in whether `cond` was produced
+/// live or (the trap) reused stale.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_latent_with_enc(
+    dit: &CosmosDiT,
+    cond: &Array,
+    uncond_enc: Option<&Array>,
+    init: &Array,
+    steps: usize,
+    guidance: f32,
+    seed: u64,
+    dtype: Dtype,
+    cancel: &CancelFlag,
+) -> Result<Array> {
+    let sigmas = anima_sigmas(steps.max(1));
+    let guidance = Array::from_slice(&[guidance], &[1]);
+    let mut prog = |_p: Progress| {};
+    let predict = |x: &Array, sigma: f32| -> Result<Array> {
+        let s = Array::from_slice(&[sigma], &[1]);
+        let v_cond = dit.forward(x, &s, cond, dtype)?;
+        let v = match uncond_enc {
+            // CFG: v = v_uncond + guidance·(v_cond − v_uncond).
+            Some(u) => {
+                let v_u = dit.forward(x, &s, u, dtype)?;
+                add(&v_u, &multiply(&subtract(&v_cond, &v_u)?, &guidance)?)?
+            }
+            None => v_cond,
+        };
+        Ok(v.as_dtype(Dtype::Float32)?)
+    };
+    run_flow_sampler(
+        Some(DEFAULT_SAMPLER),
+        TimestepConvention::Sigma,
+        &sigmas,
+        init.clone(),
+        seed,
+        cancel,
+        &mut prog,
+        predict,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    fn zero_velocity(x: &Array, _sigma: f32) -> Result<Array> {
+        Ok(Array::zeros::<f32>(x.shape())?)
+    }
+
+    fn captured_sink() -> (PreviewSink, Arc<Mutex<Vec<mlx_gen::PreviewFrame>>>) {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sink = PreviewSink::new(move |frame| captured.lock().unwrap().push(frame));
+        (sink, frames)
+    }
+
+    #[test]
+    fn active_preview_emits_one_numbered_frame_per_euler_step() {
+        let sigmas = [1.0_f32, 0.7, 0.3, 0.0];
+        let (sink, frames) = captured_sink();
+        let previews = AnimaPreview::new(&sink, &sigmas);
+
+        run_anima_sampler(
+            Some("euler"),
+            &sigmas,
+            Array::zeros::<f32>(&[1, 16, 1, 2, 3]).unwrap(),
+            16629,
+            &CancelFlag::new(),
+            &previews,
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| (frame.current, frame.total))
+                .collect::<Vec<_>>(),
+            [(1, 3), (2, 3), (3, 3)]
+        );
+        assert!(frames
+            .iter()
+            .all(|frame| (frame.image.width, frame.image.height) == (3, 2)));
+    }
+
+    #[test]
+    fn active_preview_deduplicates_multieval_heun_steps() {
+        let sigmas = [1.0_f32, 0.7, 0.3, 0.0];
+        let (sink, frames) = captured_sink();
+        let previews = AnimaPreview::new(&sink, &sigmas);
+
+        run_anima_sampler(
+            Some("heun"),
+            &sigmas,
+            Array::zeros::<f32>(&[1, 16, 1, 2, 2]).unwrap(),
+            16629,
+            &CancelFlag::new(),
+            &previews,
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames.last().map(|frame| frame.current), Some(3));
+        assert!(frames.iter().all(|frame| frame.total == 3));
+    }
+
+    #[test]
+    fn inert_preview_preserves_fixed_seed_default_sampler_bytes() {
+        let sigmas = anima_sigmas(4);
+        let seed = 16629;
+        let initial = create_noise(seed, 16, 16).unwrap();
+        let direct = run_flow_sampler(
+            Some(DEFAULT_SAMPLER),
+            TimestepConvention::Sigma,
+            &sigmas,
+            initial.clone(),
+            seed,
+            &CancelFlag::new(),
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+        let sink = PreviewSink::default();
+        let previews = AnimaPreview::new(&sink, &sigmas);
+        let wrapped = run_anima_sampler(
+            Some(DEFAULT_SAMPLER),
+            &sigmas,
+            initial,
+            seed,
+            &CancelFlag::new(),
+            &previews,
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+
+        assert_eq!(
+            direct.try_as_slice::<f32>().unwrap(),
+            wrapped.try_as_slice::<f32>().unwrap()
+        );
+        assert_eq!(previews.counter.next(&sigmas, sigmas[0]), Some(1));
+    }
+
+    #[test]
+    fn single_frame_layout_reuses_qwen_projection_exactly() {
+        let sigmas = [1.0_f32, 0.0];
+        let latents = create_noise(42, 16, 24).unwrap();
+        assert_eq!(latents.shape(), &[1, 16, 1, 3, 2]);
+
+        let (anima_sink, anima_frames) = captured_sink();
+        AnimaPreview::new(&anima_sink, &sigmas).emit(sigmas[0], &latents);
+
+        let spatial = latents.reshape(&[1, 16, 3, 2]).unwrap();
+        let (qwen_sink, qwen_frames) = captured_sink();
+        mlx_gen_qwen_image::preview::emit_spatial_preview(
+            &qwen_sink,
+            &mlx_gen::preview::PreviewCounter::new(&sigmas),
+            &sigmas,
+            sigmas[0],
+            &spatial,
+        );
+
+        let anima_frames = anima_frames.lock().unwrap();
+        let qwen_frames = qwen_frames.lock().unwrap();
+        assert_eq!(anima_frames.len(), 1);
+        assert_eq!(qwen_frames.len(), 1);
+        assert_eq!(anima_frames[0].current, qwen_frames[0].current);
+        assert_eq!(anima_frames[0].total, qwen_frames[0].total);
+        assert_eq!(anima_frames[0].image, qwen_frames[0].image);
+    }
+
+    #[test]
+    fn sigma_schedule_linspace_shift3() {
+        // N=10 ⇒ linspace(1.0, 0.1, 10) time-shifted by 3.0, trailing 0.0. Length 11.
+        let s = anima_sigmas(10);
+        assert_eq!(s.len(), 11);
+        // shift(σ) = 3σ/(1+2σ): shift(1.0)=1.0, shift(0.9)=2.7/2.8, shift(0.1)=0.3/1.2=0.25.
+        assert!((s[0] - 1.0).abs() < 1e-6, "s0={}", s[0]);
+        assert!(
+            (s[1] - (2.7 / 2.8)) < 1e-5 && (s[1] - (2.7 / 2.8)).abs() < 1e-5,
+            "s1={}",
+            s[1]
+        );
+        assert!((s[9] - 0.25).abs() < 1e-5, "s9={}", s[9]);
+        assert_eq!(s[10], 0.0);
+        // strictly descending (a valid flow schedule).
+        for w in s.windows(2) {
+            assert!(w[0] > w[1], "not descending: {} !> {}", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn sigma_schedule_turbo_10_and_base_30_lengths() {
+        assert_eq!(anima_sigmas(10).len(), 11);
+        assert_eq!(anima_sigmas(30).len(), 31);
+        assert_eq!(anima_sigmas(1), vec![1.0, 0.0]); // shift(1.0)=1.0
+    }
+
+    // ----- sc-11123 / F-115: req.scheduler is wired into the σ schedule (was advertised-but-inert) -----
+
+    /// The default path (`scheduler == None`) MUST return the native [`anima_sigmas`] schedule
+    /// **byte-for-byte** — the epic-7114 N1 default-parity guarantee. Any drift here would silently
+    /// change every existing (scheduler-less) Anima generation.
+    #[test]
+    fn schedule_default_none_is_native_byte_for_byte() {
+        for steps in [1usize, 4, 10, 30] {
+            assert_eq!(
+                anima_schedule(None, steps),
+                anima_sigmas(steps),
+                "scheduler=None must equal the native schedule byte-for-byte (steps={steps})"
+            );
+        }
+    }
+
+    /// An unknown name or a native alias falls back to the native schedule (N3 — never hard-fail a
+    /// generation over a scheduling knob; the shared capability floor already rejects non-curated names
+    /// before we get here, so this is defense-in-depth for aliases).
+    #[test]
+    fn schedule_unknown_and_native_aliases_fall_back_to_native() {
+        let native = anima_sigmas(10);
+        for name in ["", "not_a_scheduler", "linear", "flow_match_euler"] {
+            assert_eq!(
+                anima_schedule(Some(name), 10),
+                native,
+                "unknown/native-aliased scheduler {name:?} must fall back to native"
+            );
+        }
+    }
+
+    /// EVERY advertised curated scheduler must produce a valid descending σ schedule terminating in
+    /// `0.0` — proving `req.scheduler` is actually consumed, not dropped. This is the exact
+    /// `curated_scheduler_names()` menu the descriptor advertises (F-115: advertised == honored).
+    #[test]
+    fn schedule_every_advertised_scheduler_is_valid() {
+        for name in mlx_gen::curated_scheduler_names() {
+            let s = anima_schedule(Some(name), 10);
+            assert!(s.len() >= 2, "{name}: schedule too short ({})", s.len());
+            assert_eq!(*s.last().unwrap(), 0.0, "{name}: must terminate at 0.0");
+            // Strictly descending (a valid flow schedule).
+            for w in s.windows(2) {
+                assert!(w[0] > w[1], "{name}: not descending: {} !> {}", w[0], w[1]);
+            }
+        }
+    }
+
+    /// The structurally-distinct curated schedulers (they re-distribute where the steps land) MUST
+    /// change the schedule vs the native default — the load-bearing proof that the wiring is live and
+    /// not a silent fallback. `karras`/`exponential`/`beta`/`beta57`/`ddim_uniform` are the ones that
+    /// visibly diverge from Anima's `linspace(1,1/N,N)`-through-shift ramp; `normal`/`sgm_uniform`/
+    /// `simple` can nearly coincide with it, so they are not asserted to differ (only to be valid,
+    /// above).
+    #[test]
+    fn schedule_distinct_schedulers_differ_from_native() {
+        let native = anima_sigmas(10);
+        for name in ["karras", "exponential", "beta", "beta57", "ddim_uniform"] {
+            let s = anima_schedule(Some(name), 10);
+            let differs =
+                s.len() != native.len() || s.iter().zip(&native).any(|(a, b)| (a - b).abs() > 1e-4);
+            assert!(
+                differs,
+                "{name}: must re-shape the schedule vs native (req.scheduler ignored?)"
+            );
+        }
+    }
+}

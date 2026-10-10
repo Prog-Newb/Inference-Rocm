@@ -1,0 +1,51 @@
+[package]
+name = "candle-llm"
+version = "0.0.0"
+edition = "2021"
+description = "On-device text LLM serving engine for the Candle backend (cross-platform incl. Windows/CUDA); validates the core-llm contract. Work in progress."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+readme = "README.md"
+keywords = ["candle", "cuda", "llm", "inference", "serving"]
+categories = ["science"]
+
+[dependencies]
+# The Candle tensor backend. Pinned to the SAME git rev the `candle-gen` sibling family pins
+# (huggingface/candle post-0.10.2) so the whole on-device stack resolves ONE candle build — and
+# because that rev clears `CUDA_ERROR_INVALID_PTX` on Blackwell (sm_120). CPU by default; the
+# `cuda` / `metal` features select a GPU backend. Re-pin in lockstep with candle-gen.
+# Bumped `65ecb58` -> `c1e6756` (2026-07-02, lockstep with candle-gen): picks up upstream PR #3493,
+# the `QStorage::from_data(Cow::Owned…)` use-after-free fix. 4-commit range (the fix + three
+# Metal-only SDPA fixes); no API changes, candle-kernels byte-identical across the range.
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+# Fused FlashAttention-2 CUDA kernels for the decode/prefill attention seam. Optional — pulled in
+# ONLY by the `flash-attn` feature (it compiles a large CUDA/CUTLASS kernel set and needs the CUDA
+# toolkit). Pinned to the SAME candle git rev so it links against one candle build.
+candle-flash-attn = { workspace = true, optional = true }
+# The backend-neutral contract this crate implements. The root workspace path keeps Candle and MLX
+# providers on one contract package and type identity.
+core-llm = { workspace = true }
+# Error plumbing for the engine surface.
+thiserror = { workspace = true }
+# config.json parsing (HF model configs) — Value-based, no derive, matching the mlx-llm convention.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# Run the registered LlamaProvider through the backend-neutral contract checks.
+core-llm-testkit = { workspace = true }
+# Self-removing fixture roots for the test suites (sc-17755).
+tempfile = { workspace = true }
+
+[features]
+# Default works with NO extra features: candle-core defaults to the CPU backend (builds anywhere).
+default = []
+# NVIDIA CUDA backend (the Windows target). MUST NOT be in `default` — it needs the CUDA toolkit.
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+# Apple Metal GPU backend.
+metal = ["candle-core/metal", "candle-nn/metal"]
+# FlashAttention-2 (Windows/CUDA). Implies `cuda` and pulls in `candle-flash-attn`'s fused kernels,
+# which the attention seam (`primitives::attention::sdpa`) dispatches to for the dense causal path,
+# falling back to the eager softmax SDPA for the cases the kernel can't serve (soft-cap, mismatched
+# q/v head dims, padded-batch masks, f32/CPU). NOTE: candle-flash-attn ships sm80 kernels.
+flash-attn = ["cuda", "dep:candle-flash-attn"]

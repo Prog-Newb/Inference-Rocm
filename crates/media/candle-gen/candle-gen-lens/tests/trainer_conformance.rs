@@ -1,0 +1,76 @@
+//! Real-weight gen-core **Trainer contract** conformance for the candle `lens` trainer (sc-5147,
+//! epic 3720 / sc-4895) — the candle twin of `mlx-gen-lens/tests/trainer_conformance.rs`.
+//!
+//! Drives the actual [`LensTrainer`](candle_gen_lens::training) through the backend-neutral checks
+//! (capability honesty, `TrainingProgress` monotonicity, typed cancellation before any step).
+//! `#[ignore]` + `cfg(feature = "cuda")` because it needs the real `microsoft/Lens` weights
+//! (`LENS_BASE_SNAPSHOT` or the HF cache) — including the ~40 GB gpt-oss encoder — and a CUDA GPU.
+//! On the Windows/Blackwell box (v143 vcvars + CUDA on PATH):
+//!
+//! ```text
+//! set LENS_BASE_SNAPSHOT=C:\Users\…\models--microsoft--Lens\snapshots\<hash>
+//! cargo test -p candle-gen-lens --features cuda --release --test trainer_conformance -- --ignored --nocapture
+//! ```
+//!
+//! The profile is forced to **bf16** (the DiT's native dtype) and gradient-checkpointing on (the
+//! trainer always checkpoints the 48-block backward).
+#![cfg(feature = "cuda")]
+
+use std::path::{Path, PathBuf};
+
+use candle_gen::gen_core::{LoadSpec, TrainingItem, WeightsSource};
+use gen_core_testkit::TrainerProfile;
+
+/// The `microsoft/Lens` base snapshot dir — `LENS_BASE_SNAPSHOT` or the first HF-cache snapshot.
+fn snapshot() -> PathBuf {
+    let p = std::env::var("LENS_BASE_SNAPSHOT").unwrap_or_else(|_| panic!("set LENS_BASE_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
+}
+
+/// Two solid-colour swatch PNGs + captions in `dir` (mirrors the trainer e2e dataset). Captions are
+/// long enough to clear the gpt-oss harmony preamble so they carry text features.
+fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).unwrap();
+    let mut items = Vec::new();
+    for (i, color) in [[200u8, 40, 40], [40, 80, 200]].iter().enumerate() {
+        let mut img = image::RgbImage::new(96, 96);
+        for px in img.pixels_mut() {
+            *px = image::Rgb(*color);
+        }
+        let path = dir.join(format!("img{i}.png"));
+        img.save(&path).unwrap();
+        items.push(TrainingItem {
+            image_path: path,
+            caption: format!("a solid colour swatch number {i}"),
+            control_image_path: None,
+        });
+    }
+    items
+}
+
+#[test]
+#[ignore = "needs real microsoft/Lens weights (LENS_BASE_SNAPSHOT or HF cache) + a CUDA GPU; run with --features cuda --ignored"]
+fn lens_trainer_satisfies_gen_core_contract() {
+    assert_eq!(candle_gen_lens::MODEL_ID_BASE, "lens");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
+    let items = make_dataset(&tmp.join("data"));
+    let mut profile = TrainerProfile::cheap(items, tmp.join("out"));
+    // The Lens DiT trains at its native bf16; the trainer always gradient-checkpoints the 48-block
+    // backward, so set the flag for honesty.
+    profile.config.train_dtype = "bf16".to_string();
+    profile.config.gradient_checkpointing = true;
+    let snap = snapshot();
+
+    gen_core_testkit::trainer_conformance(
+        || {
+            let spec = LoadSpec::new(WeightsSource::Dir(snap.clone()));
+            candle_gen_lens::provider_registry()
+                .unwrap()
+                .load_trainer("lens", &spec)
+                .expect("load lens trainer")
+        },
+        &profile,
+    );
+}

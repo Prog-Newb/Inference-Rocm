@@ -1,0 +1,89 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/audio/candle-audio",
+    "crates/audio/candle-audio-acestep",
+    "crates/audio/candle-audio-catalog",
+    "crates/audio/candle-audio-chatterbox",
+    "crates/audio/candle-audio-chatterbox-ve",
+    "crates/audio/candle-audio-clap",
+    "crates/audio/candle-audio-kokoro",
+    "crates/audio/candle-audio-mmaudio",
+    "crates/audio/candle-audio-moss-sfx",
+    "crates/audio/candle-audio-moss-tts",
+    "crates/audio/candle-audio-moss-tts-realtime",
+    "crates/audio/candle-audio-openvoice",
+    "crates/audio/candle-audio-stable-audio-3",
+    "crates/audio/candle-audio-whisper",
+    "crates/contracts/core-llm",
+    "crates/contracts/core-llm/core-llm-testkit",
+    "crates/contracts/gen-core",
+    "crates/contracts/gen-core-testkit",
+    "crates/bundles/*",
+    "crates/llm/candle-llm",
+    "crates/llm/mlx-llm",
+    "crates/llm/mlx-llm/server",
+    "crates/media/mlx-gen",
+    "crates/media/mlx-gen/mlx-gen-*",
+    "crates/media/candle-gen/candle-gen*",
+]
+exclude = [
+    "crates/media/candle-gen/vendor/candle-kernels",
+]
+
+# Internal packages are paths so a checkout has one contract package, one
+# provider registry, and no dependency on unpublished repository state.
+[workspace.dependencies]
+core-llm = { path = "crates/contracts/core-llm" }
+core-llm-testkit = { path = "crates/contracts/core-llm/core-llm-testkit" }
+mlx-llm = { path = "crates/llm/mlx-llm" }
+candle-llm = { path = "crates/llm/candle-llm" }
+sceneworks-gen-core = { path = "crates/contracts/gen-core" }
+sceneworks-gen-core-testkit = { path = "crates/contracts/gen-core-testkit" }
+runtime-catalog = { path = "crates/bundles/runtime-catalog" }
+mlx-gen-catalog = { path = "crates/media/mlx-gen/mlx-gen-catalog" }
+candle-gen-catalog = { path = "crates/media/candle-gen/candle-gen-catalog" }
+candle-audio-catalog = { path = "crates/audio/candle-audio-catalog" }
+
+# MLX fork pinned by commit SHA. rev 932beb4e = MLX 0.32.0 bump + pad/concat >i32::MAX copy-gate fix
+# + regenerated patches (epic 12742). See crates/media/mlx-gen/Cargo.toml for the full SHA lineage.
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "932beb4e60db44d378ffa1fe648defea59b5cbd0" }
+mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "932beb4e60db44d378ffa1fe648defea59b5cbd0" }
+
+# Candle pins are shared by media and LLM providers.
+# Upstream PR #3531 removes O(groups) launches from unit-stride depthwise convs (sc-12111).
+candle-core = { git = "https://github.com/huggingface/candle", rev = "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d" }
+candle-nn = { git = "https://github.com/huggingface/candle", rev = "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d" }
+candle-transformers = { git = "https://github.com/huggingface/candle", rev = "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d" }
+candle-flash-attn = { git = "https://github.com/huggingface/candle", rev = "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d" }
+
+thiserror = "2"
+serde_json = "1"
+safetensors = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+rand = "0.9"
+rand_distr = "0.5"
+# Audio validation harness (sc-12854): repeatability hash over PCM bytes.
+sha2 = "0.10"
+# Audio validation harness (sc-12854): `getrusage(RUSAGE_SELF)` peak-RSS on macOS/Linux.
+# Already in the resolved graph transitively.
+libc = "0.2"
+# Test-only RAII temp directories (sc-17704). Test helpers that built their own
+# `env::temp_dir().join(format!("...-{pid}-{n}"))` fixture roots leaked one directory per call
+# forever; a `TempDir` guard removes the tree on `Drop`, including out of a panicking test, and
+# draws its uniqueness from OS randomness rather than a recyclable PID.
+tempfile = "3"
+
+# Preserve Candle's dependency optimization for debug/test parity suites.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Preserve the vendored multi-architecture CUDA kernel override.
+# Local AMD ROCm Candle override.
+[patch."https://github.com/huggingface/candle"]
+candle-core = { path = "C:/SceneWorks-AMD/candle-rocm-test/candle/candle-core" }
+candle-nn = { path = "C:/SceneWorks-AMD/candle-rocm-test/candle/candle-nn" }
+candle-transformers = { path = "C:/SceneWorks-AMD/candle-rocm-test/candle/candle-transformers" }
+candle-flash-attn = { path = "C:/SceneWorks-AMD/candle-rocm-test/candle/candle-flash-attn" }
+candle-kernels = { path = "crates/media/candle-gen/vendor/candle-kernels" }

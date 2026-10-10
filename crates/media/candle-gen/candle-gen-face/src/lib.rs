@@ -1,0 +1,234 @@
+//! # candle-gen-face
+//!
+//! Native **candle** face-analysis stack — the Windows/CUDA sibling of
+//! [`mlx-gen-face`](https://github.com/michaeltrefry/mlx-gen). A SCRFD-10g 5-point detector
+//! ([`scrfd`]) + an ArcFace `glintr100` (iresnet100) 512-d embedder ([`iresnet`]) + the
+//! insightface-faithful 5-point alignment ([`align`]), orchestrated by [`face::FaceAnalysis`] and
+//! exposed through the backend-neutral `gen_core::FaceEmbedder` contract (epic 5480, sc-5490).
+//!
+//! Consumers — the candle InstantID (sc-5491) and PuLID-FLUX (sc-5492) identity providers, and the
+//! Phase-5 keypoint-extract surface (epic 5482) — depend on the `gen_core` trait, not this crate's
+//! concrete types, so the worker stays backend-neutral. macOS keeps the MLX implementation.
+//!
+//! Unlike the Generator providers this crate is not part of a provider catalog: a face
+//! embedder is a composed utility, so consumers construct it directly via [`load`] / [`load_on`].
+
+pub mod align;
+pub mod bisenet;
+mod common;
+pub mod face;
+pub mod iresnet;
+#[cfg(test)]
+mod parity;
+pub mod scrfd;
+
+use std::path::Path;
+
+use candle_gen::candle_core::Device;
+use candle_gen::gen_core::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor, Image};
+use candle_gen::{CandleError, Result};
+
+use crate::common::Weights;
+use crate::face::{Face, FaceAnalysis};
+use crate::iresnet::ArcFace;
+use crate::scrfd::Scrfd;
+
+/// Stable id for the antelopev2 SCRFD + ArcFace pair.
+const MODEL_ID: &str = "antelopev2";
+/// ArcFace `glintr100` embedding dimensionality.
+const EMBEDDING_DIM: usize = 512;
+/// Detector checkpoint filename (shared with the MLX `convert_scrfd.py` output).
+const SCRFD_FILE: &str = "scrfd_10g.safetensors";
+/// Recognizer checkpoint filename (shared with the MLX `convert_glintr100.py` output).
+const ARCFACE_FILE: &str = "arcface_iresnet100.safetensors";
+/// BiSeNet face-parsing checkpoint filename (the PuLID `face_features_image` path, sc-5492; shared
+/// with the MLX `convert_bisenet.py` output).
+const BISENET_FILE: &str = "bisenet_parsing.safetensors";
+
+/// The candle face embedder: a thin `gen_core::FaceEmbedder` adapter over [`FaceAnalysis`].
+pub struct CandleFaceAnalysis {
+    inner: FaceAnalysis,
+    descriptor: FaceEmbedderDescriptor,
+}
+
+impl CandleFaceAnalysis {
+    fn descriptor() -> FaceEmbedderDescriptor {
+        FaceEmbedderDescriptor {
+            id: MODEL_ID,
+            family: "face",
+            backend: "candle",
+            embedding_dim: EMBEDDING_DIM,
+            mac_only: false,
+        }
+    }
+
+    /// Access the underlying [`FaceAnalysis`] for the concrete-typed helpers the identity providers
+    /// need beyond the neutral contract (e.g. embed-on-demand of a chosen detection).
+    pub fn inner(&self) -> &FaceAnalysis {
+        &self.inner
+    }
+}
+
+/// Load the SCRFD + ArcFace pair from a directory holding `scrfd_10g.safetensors` +
+/// `arcface_iresnet100.safetensors`, onto `device`. (The face stack runs f32 regardless of the
+/// build's default dtype.)
+pub fn load_on(dir: &Path, device: &Device) -> Result<CandleFaceAnalysis> {
+    let scrfd_w = Weights::from_file(&dir.join(SCRFD_FILE), device)?;
+    let arcface_w = Weights::from_file(&dir.join(ARCFACE_FILE), device)?;
+    let scrfd = Scrfd::from_weights(&scrfd_w)?;
+    let arcface = ArcFace::from_weights(&arcface_w)?;
+    Ok(CandleFaceAnalysis {
+        inner: FaceAnalysis::new(scrfd, arcface, device.clone()),
+        descriptor: CandleFaceAnalysis::descriptor(),
+    })
+}
+
+/// Load the face stack onto the build's default compute device (CUDA on Windows, CPU/Metal on Mac).
+pub fn load(dir: &Path) -> Result<CandleFaceAnalysis> {
+    let device = candle_gen::default_device()?;
+    load_on(dir, &device)
+}
+
+/// Load the SCRFD + ArcFace pair **plus** the BiSeNet parser (`bisenet_parsing.safetensors` in `dir`)
+/// onto `device` — the PuLID-FLUX path (sc-5492), which needs `face_features_image`. Reach the parser
+/// via [`CandleFaceAnalysis::inner`]`().face_features_image(..)`.
+pub fn load_with_parser_on(dir: &Path, device: &Device) -> Result<CandleFaceAnalysis> {
+    let scrfd_w = Weights::from_file(&dir.join(SCRFD_FILE), device)?;
+    let arcface_w = Weights::from_file(&dir.join(ARCFACE_FILE), device)?;
+    let bisenet_w = Weights::from_file(&dir.join(BISENET_FILE), device)?;
+    let scrfd = Scrfd::from_weights(&scrfd_w)?;
+    let arcface = ArcFace::from_weights(&arcface_w)?;
+    let inner = FaceAnalysis::new(scrfd, arcface, device.clone()).with_parser(&bisenet_w)?;
+    Ok(CandleFaceAnalysis {
+        inner,
+        descriptor: CandleFaceAnalysis::descriptor(),
+    })
+}
+
+/// Load the SCRFD + ArcFace + BiSeNet stack onto the build's default compute device (PuLID path).
+pub fn load_with_parser(dir: &Path) -> Result<CandleFaceAnalysis> {
+    let device = candle_gen::default_device()?;
+    load_with_parser_on(dir, &device)
+}
+
+/// Returns an [`Image`]'s `(height, width)`, enforcing the backend-neutral image contract: both
+/// dimensions are non-zero and the RGB buffer is exactly `width·height·3` bytes. This is stricter
+/// than the raw-slice helpers in [`face`], which intentionally accept a larger backing slice and read
+/// only the prefix described by their explicit dimensions.
+fn image_dims(image: &Image) -> Result<(usize, usize)> {
+    let (w, h) = (image.width as usize, image.height as usize);
+    if w == 0 || h == 0 {
+        return Err(CandleError::Msg(format!(
+            "face: image has a zero dimension ({w}×{h})"
+        )));
+    }
+    let expected = candle_gen::gen_core::imageops::checked_image_buffer_len(w, h, 3)
+        .ok_or_else(|| CandleError::Msg(format!("face: RGB buffer size overflows for {w}×{h}")))?;
+    if image.pixels.len() != expected {
+        return Err(CandleError::Msg(format!(
+            "face: image buffer must contain exactly {expected} bytes for {w}×{h}×3, got {}",
+            image.pixels.len(),
+        )));
+    }
+    Ok((h, w))
+}
+
+fn to_detected(face: &Face) -> DetectedFace {
+    DetectedFace {
+        bbox: face.bbox,
+        kps: face.kps,
+        det_score: face.det_score,
+        embedding: face.embedding.clone(),
+    }
+}
+
+impl FaceEmbedder for CandleFaceAnalysis {
+    fn descriptor(&self) -> &FaceEmbedderDescriptor {
+        &self.descriptor
+    }
+
+    fn detect(&self, image: &Image) -> candle_gen::gen_core::Result<Vec<DetectedFace>> {
+        let (h, w) = image_dims(image)?;
+        Ok(self
+            .inner
+            .detect(&image.pixels, h, w)?
+            .iter()
+            .map(|d| DetectedFace {
+                bbox: d.bbox,
+                kps: d.kps,
+                det_score: d.score,
+                embedding: Vec::new(),
+            })
+            .collect())
+    }
+
+    fn analyze(&self, image: &Image) -> candle_gen::gen_core::Result<Vec<DetectedFace>> {
+        let (h, w) = image_dims(image)?;
+        Ok(self
+            .inner
+            .analyze(&image.pixels, h, w)?
+            .iter()
+            .map(to_detected)
+            .collect())
+    }
+
+    /// Detect + embed only the largest face (F-090): one detect sweep + a single recognition forward
+    /// on the area-largest detection, instead of embedding every face the default would.
+    fn largest_face(&self, image: &Image) -> candle_gen::gen_core::Result<DetectedFace> {
+        let (h, w) = image_dims(image)?;
+        let dets = self.inner.detect(&image.pixels, h, w)?;
+        let Some(largest) = dets.first() else {
+            return Err(candle_gen::gen_core::Error::Msg(format!(
+                "{MODEL_ID}: no face detected"
+            )));
+        };
+        Ok(to_detected(&self.inner.embed(
+            &image.pixels,
+            h,
+            w,
+            largest,
+        )?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(width: u32, height: u32, len: usize) -> Image {
+        Image {
+            width,
+            height,
+            pixels: vec![0; len],
+        }
+    }
+
+    #[test]
+    fn image_dims_accepts_exact_nonzero_rgb_buffer() {
+        assert_eq!(image_dims(&image(3, 2, 18)).unwrap(), (2, 3));
+    }
+
+    #[test]
+    fn image_dims_rejects_short_and_extra_buffers() {
+        for len in [17, 19] {
+            let err = image_dims(&image(3, 2, len)).unwrap_err().to_string();
+            assert!(err.contains("exactly 18 bytes"), "len {len}: {err}");
+        }
+    }
+
+    #[test]
+    fn image_dims_rejects_zero_edges_before_buffer_validation() {
+        for (w, h) in [(0, 0), (0, 2), (3, 0)] {
+            let err = image_dims(&image(w, h, 0)).unwrap_err().to_string();
+            assert!(err.contains("zero dimension"), "{w}×{h}: {err}");
+        }
+    }
+
+    #[test]
+    fn image_dims_rejects_overflowing_rgb_size() {
+        let err = image_dims(&image(u32::MAX, u32::MAX, 0))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("overflows"), "{err}");
+    }
+}

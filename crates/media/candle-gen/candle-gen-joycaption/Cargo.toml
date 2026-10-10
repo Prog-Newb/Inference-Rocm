@@ -1,0 +1,27 @@
+[package]
+name = "candle-gen-joycaption"
+version = "0.0.0"
+edition = "2021"
+description = "JoyCaption (LLaVA: SigLIP + Llama-3.1-8B) image-captioning provider crate for candle-gen — the Windows/CUDA sibling of mlx-gen-joycaption."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "joycaption", "captioning", "inference"]
+categories = ["science"]
+
+[dependencies]
+candle-gen = { path = "../candle-gen" }
+# Force-link the unified Candle LLM engine so its `candle-llava` core-llm
+# provider registration is available to this JoyCaption shim. The workspace
+# path guarantees one Candle tensor type and one core-llm registry.
+candle-llm = { workspace = true }
+
+[features]
+default = []
+# Forward the backend feature to candle-llm as well so the `candle-llava` provider's tower + decoder
+# run on the selected device (the CUDA worker build needs candle-llm built with `cuda`).
+metal = ["candle-gen/metal", "candle-llm/metal"]
+cuda = ["candle-gen/cuda", "candle-llm/cuda"]
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+sceneworks-gen-core-testkit = { workspace = true }

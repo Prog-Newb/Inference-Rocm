@@ -1,0 +1,53 @@
+[package]
+name = "candle-audio"
+version = "0.0.0"
+edition = "2021"
+description = "Shared candle audio commons for SceneWorks audio-generation providers — device seam, STFT/mel/iSTFT DSP, and WAV encoding over the gen-core audio contract. Weights are passed in explicitly via LoadSpec; the lane never self-fetches (epic 13657)."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["candle", "audio", "tts", "inference"]
+categories = ["science"]
+
+[dependencies]
+# The backend-neutral contract (audio surface landed in sc-12834: `Modality::Audio`,
+# `GenerationOutput::Audio(AudioTrack)`, `AudioParams`, `Capabilities::validate_request_audio`).
+# The root workspace path keeps every provider family on one contract package and type identity.
+sceneworks-gen-core = { workspace = true }
+# The candle tensor backend — the audio lane is Candle-native on every platform
+# (docs/architecture/audio-backend-strategy.md). Same workspace pin the candle-gen and candle-llm
+# families use, so the whole on-device stack resolves ONE candle build. CPU by default; the
+# `metal` / `cuda` features select a GPU backend per platform.
+candle-core = { workspace = true }
+# Error plumbing for the engine surface (mirrors candle-gen's CandleError seam).
+thiserror = { workspace = true }
+# Repeatability hash over generated PCM bytes for the validation harness (`harness`, sc-12854).
+sha2 = { workspace = true }
+
+# Peak-RSS process metric for the validation harness (`harness`, sc-12854):
+# `getrusage(RUSAGE_SELF).ru_maxrss` on macOS/Linux. Non-unix targets report `None`.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[features]
+# Default works with NO extra features: candle-core defaults to the CPU backend (builds anywhere),
+# and the walking-skeleton audio models synthesize in real time on CPU (audio-backend-strategy.md).
+default = []
+# Test-support seam for the candle audio provider crates — provider crates enable it under
+# `[dev-dependencies]` (mirroring candle-gen's testkit) so it never compiles into a production
+# build. CI compiles it explicitly via `--features candle-audio/testkit` (ci.yml) so the module
+# is exercised even while no in-tree target dev-depends on it yet (the sc-11990 cfg-hole guard).
+# The HF-cache snapshot scanners this feature once carried were removed under epic 13657 (inference
+# never self-fetches or derives an HF-cache location); the seam is retained for future shared,
+# cache-free audio test helpers.
+testkit = []
+# Apple Metal GPU backend — a per-model implementation option on runtime-macos (the audio lane
+# ships Candle-CPU there today; see audio-backend-strategy.md). NOT in `default`.
+metal = ["candle-core/metal"]
+# NVIDIA CUDA backend (the Windows target). MUST NOT be in `default` — it needs the CUDA toolkit.
+cuda = ["candle-core/cuda"]
+
+[dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }

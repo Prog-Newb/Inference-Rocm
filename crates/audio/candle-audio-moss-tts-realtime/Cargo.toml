@@ -1,0 +1,55 @@
+[package]
+name = "candle-audio-moss-tts-realtime"
+version = "0.0.0"
+edition = "2021"
+description = "MOSS-TTS-Realtime-1.7B streaming-TTS provider for the SceneWorks Candle audio lane (sc-13334/sc-13392) — an autoregressive Qwen3-1.7B backbone plus a CSM-style local/depth transformer decoding 16 RVQ speech-codebook tokens per frame, and a native port of the MOSS-Audio-Tokenizer RLFQ codec (RVQ tokens -> 24 kHz waveform), ported onto the pinned candle revision. Registered into candle-audio-catalog as a real, deterministic, genuinely-interleaved streaming TTS provider; text-fidelity comes from the reference delay-pattern text conditioning (sc-13570) and is guarded by an ASR round-trip CER gate (sc-13433)."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["candle", "audio", "tts", "streaming", "rvq"]
+categories = ["science"]
+
+[dependencies]
+# Shared candle audio commons (device seam, pinned-SHA hub resolution, WAV encode, AudioError
+# bridge). Re-exports `gen_core` and `candle_core`, so this crate resolves the SAME candle build +
+# gen-core rev as the catalog it will register into once the codec lands.
+candle-audio = { path = "../candle-audio" }
+# candle-nn at the workspace's pinned candle revision (Linear/RmsNorm/Embedding/VarBuilder — the
+# Qwen3 backbone and the local/depth transformer are built from these primitives).
+candle-nn = { workspace = true }
+# Snapshot-preparer contract types for the audio-lane MOSS-TTS-aware preparer probe.
+core-llm = { workspace = true }
+# The Qwen tokenizer (`tokenizer.json` in the pinned snapshot). Workspace pin — the 0.22 side of the
+# intentional tokenizers 0.21/0.22 split (check-workspace.py).
+tokenizers = { workspace = true }
+# Config parsing (config.json: language_config / local_config + top-level audio-token ids).
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }
+# The backend-neutral audio-generator conformance suite (streaming reassembly law, seed
+# determinism) the real-weight test runs against the loaded provider.
+sceneworks-gen-core-testkit = { workspace = true }
+# The Whisper transcriber drives the sc-13433 ASR round-trip text-fidelity gate: known prompt →
+# MOSS-TTS-Realtime WAV → Whisper transcript → CER assertion (same round-trip pattern the whisper
+# crate uses with Kokoro). Dev-only; no runtime edge, so the shipping catalog surface is unchanged.
+candle-audio-whisper = { path = "../candle-audio-whisper" }
+# The shipped Chatterbox CAMPPlus x-vector speaker encoder drives the sc-14149 voice-clone
+# speaker-identity gate (the cloned output resembles the reference speaker more than the default
+# voice). Dev-only + env-gated (CHATTERBOX_SNAPSHOT), so the shipping surface is unchanged.
+candle-audio-chatterbox = { path = "../candle-audio-chatterbox" }
+# Kokoro renders the committed voice-clone reference clip (sc-17264,
+# `examples/voiceclone_ref_clip`) — the repository's sanctioned reference-audio path, so no
+# third-party audio fixture is committed and there is no clip licence to clear. Used only by that
+# example; no test and no shipping surface depends on it.
+candle-audio-kokoro = { path = "../candle-audio-kokoro" }
+
+[features]
+default = []
+# Apple Metal GPU backend — forwarded to the shared audio commons. Not in `default`.
+metal = ["candle-audio/metal", "candle-nn/metal"]
+# NVIDIA CUDA backend — forwarded to the shared audio commons. Not in `default`.
+cuda = ["candle-audio/cuda", "candle-nn/cuda"]

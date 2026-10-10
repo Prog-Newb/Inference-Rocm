@@ -1,0 +1,997 @@
+//! `Ideogram4` — the [`mlx_gen::Generator`] implementation for Ideogram 4.0, plus its
+//! [`descriptor`]/[`load`] entry points and explicit registration under id `"ideogram_4"`
+//! (sc-5988).
+//!
+//! [`load`] assembles the pipeline (2 DiTs + Qwen3-VL TE + VAE + tokenizer) from a converted
+//! snapshot directory ([`crate::pipeline::Ideogram4Pipeline`]); [`Ideogram4::generate`] runs the
+//! full prompt→image flow per requested image — tokenize the (JSON-caption) prompt natively,
+//! asymmetric-CFG flow-match denoise, VAE decode → RGB8 — honoring `req.cancel` and streaming
+//! `Progress`. `spec.quantize` (Q4/Q8) quantizes the whole model in place after the dense load
+//! (sc-5989); a precision override and LoRA adapters are rejected rather than silently ignored.
+
+use std::path::Path;
+
+use mlx_gen::{
+    default_seed, AdapterKind, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
+    GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality,
+    ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency, Result, SizeFloor,
+    WeightsSource,
+};
+use mlx_gen_flux2::model::PID_BACKBONE;
+use mlx_gen_pid::{resolve_pid_decoder_at_sigma, PidEngine};
+use mlx_rs::{Array, Dtype};
+
+use crate::config::{
+    DEFAULT_GUIDANCE, DEFAULT_IMG2IMG_STRENGTH, DEFAULT_INPAINT_STRENGTH, DEFAULT_STEPS,
+    DEFAULT_TURBO_STEPS, IDEOGRAM_4_ID, IDEOGRAM_4_TURBO_ID, RES_MAX, RES_MIN, RES_MULTIPLE,
+    TURBO_LORA_FILE, TURBO_LORA_SCALE,
+};
+use crate::pipeline::{Ideogram4Heavy, Ideogram4Text};
+
+/// Registry id (matches the SceneWorks worker's `payload.model`).
+pub const MODEL_ID: &str = IDEOGRAM_4_ID;
+
+/// Registry id for the few-step CFG-free turbo variant (issue #488).
+pub const MODEL_ID_TURBO: &str = IDEOGRAM_4_TURBO_ID;
+
+/// Max images per request (the image-model standard, shared with the other MLX families).
+const MAX_COUNT: u32 = 8;
+/// Max aspect ratio (long:short) — the reference supports up to 6:1.
+const MAX_ASPECT: u32 = 6;
+
+/// Ideogram 4's identity + capabilities — constructible without loading weights (registry
+/// introspection / capability advertisement).
+pub fn descriptor() -> ModelDescriptor {
+    ModelDescriptor {
+        control_kinds: None,
+        required_components: &[],
+        id: MODEL_ID,
+        family: "ideogram",
+        backend: "mlx",
+        modality: Modality::Image,
+        capabilities: Capabilities {
+            // Asymmetric CFG runs a separate *unconditional* DiT — the "negative" is a fixed
+            // trained model, not a user negative prompt — so `guidance` is offered but a negative
+            // prompt is not.
+            supports_negative_prompt: false,
+            supports_guidance: true,
+            supports_true_cfg: false,
+            // Edit (sc-6303/6330): img2img / Remix via a source `Reference`, and mask inpaint via a
+            // `Mask` (white = repaint) alongside the `Reference`. The prompt stays the model's native
+            // JSON caption. No control/pose/multi-reference. Edit works in both quality and turbo.
+            conditioning: vec![ConditioningKind::Reference, ConditioningKind::Mask],
+            // User LoRA/LoKr adapters apply onto the **conditional** DiT via the shared strict
+            // loader (`apply_ideogram_adapters` — the same seam the bundled TurboTime LoRA uses;
+            // asymmetric CFG then amplifies the adapter's direction, matching how single-DiT
+            // Ideogram community LoRAs are trained). Applied after any Q4/Q8 quantize; on turbo
+            // they stack after the bundled TurboTime LoRA.
+            supports_lora: true,
+            supports_lokr: true,
+            // Bespoke-by-architecture (epic 7114, sc-7120, task 7184): Ideogram is NOT routed through
+            // the unified curated-sampler framework. Its `LogitNormalSchedule` is an INVERTED, clamped
+            // logit-normal time grid (no `σ = 0` terminal), so the FLOW `x0 = x − σ·v` estimate the
+            // multistep/2nd-order solvers (heun / dpmpp_2m / uni_pc) require is meaningless; it uses a
+            // per-step CFG guidance schedule (POLISH_GUIDANCE on the final steps) and an inpaint
+            // mask-blend interleaved BETWEEN Euler steps (no post-step hook in `run_flow_sampler`).
+            // Advertising the curated menu would expose solvers that produce broken output — so the
+            // native logit-normal Euler is its only valid sampler. See `pipeline::run_denoise`.
+            samplers: Vec::new(),
+            schedulers: Vec::new(),
+            supported_guidance_methods: vec![],
+            min_size: RES_MIN,
+            max_size: RES_MAX,
+            max_count: MAX_COUNT,
+            mac_only: true,
+            // Load-time Q4/Q8 over the whole model (both DiTs + TE + VAE), sc-5989. Q8 default is
+            // the worker's call; Q4 roughly halves the ~27 GB Q8 weights for smaller Macs.
+            supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
+            supports_kv_cache: false,
+            requires_sigma_shift: false,
+            // Wired onto the shared `Residency` seam (epic 10834, sc-10840); honors Sequential offload
+            // (F-176). Under `Sequential` the Qwen3-VL text encoder is encoded, materialized, then
+            // dropped before the two DiTs + VAE load — bounding peak unified memory to
+            // `max(TE, DiTs+VAE)`. Ideogram Q4/Q8 quantize the whole model DENSE at load, so a
+            // `Sequential` + `quantize` load re-quantizes each generate (F-181 advisory in `load`).
+            supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
+            supports_preview: true,
+            supports_prompt_enhancement: false,
+            supports_streaming: false,
+            supports_multi_speaker: false,
+            supports_conversation_history: false,
+            supports_conversation_session: false,
+            max_speakers: None,
+            // No audio surface (sc-12834): pure image/video model.
+            audio_sample_rates: vec![],
+            max_audio_duration_secs: None,
+            audio_voices: vec![],
+            audio_languages: vec![],
+            audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
+        },
+    }
+}
+
+/// Ideogram 4 **turbo** identity + capabilities (issue #488). Same surface as [`descriptor`] except
+/// it is **CFG-free** — the TurboTime LoRA distilled the guided velocity into a single DiT, so
+/// `guidance` is not offered (no unconditional branch). Few-step (`DEFAULT_TURBO_STEPS`), single DiT.
+pub fn descriptor_turbo() -> ModelDescriptor {
+    let mut d = descriptor();
+    d.id = MODEL_ID_TURBO;
+    // CFG-free: there is no unconditional DiT to mix against, so guidance is inert. (negative-prompt
+    // and true_cfg were already off.)
+    d.capabilities.supports_guidance = false;
+    d
+}
+
+/// A loaded Ideogram 4 generator: the cached descriptor + the turbo flag + the component-residency
+/// strategy (epic 10834, sc-10840). Holds ONLY the [`Residency`] (no direct encoder/DiT/VAE/PiD
+/// fields — a retained component would defeat the `Sequential` drop): `Resident` (default) holds the
+/// Qwen3-VL TE + two DiTs + VAE (+ any PiD overlay) warm for the whole job and across jobs;
+/// `Sequential` holds only the per-phase loader closures and re-loads each per generation in phase
+/// order (encode → **drop the TE** → the DiTs/VAE/PiD), bounding peak unified memory to
+/// `max(TE, DiTs+VAE)`.
+pub struct Ideogram4 {
+    descriptor: ModelDescriptor,
+    /// `true` for `ideogram_4_turbo` (CFG-free single DiT) — selects the few-step default and the
+    /// turbo heavy-load path (single DiT + bundled TurboTime LoRA). Known without loading weights.
+    turbo: bool,
+    residency: Residency<Ideogram4Text, Ideogram4HeavyOwned>,
+}
+
+/// The heavy render-phase components owned by a `Resident` build or a `Sequential` generate (mirrors
+/// lens's `LensHeavyOwned`): the two DiTs + VAE ([`Ideogram4Heavy`]) plus the optional PiD overlay.
+pub(crate) struct Ideogram4HeavyOwned {
+    heavy: Ideogram4Heavy,
+    /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7847): loaded when the spec carries
+    /// `LoadSpec::pid` AND this generate uses it (F-177). `Some` → a `req.use_pid` generation decodes
+    /// through the `flux2` student (4× SR; Ideogram is the FLUX.2 VAE latent space). `None` → the
+    /// byte-exact native VAE path.
+    pid: Option<PidEngine>,
+}
+
+/// Construct an [`Ideogram4`] from a [`LoadSpec`]. `spec.weights` must be a [`WeightsSource::Dir`]
+/// pointing at a converted snapshot (`transformer/ unconditional_transformer/ text_encoder/ vae/
+/// tokenizer/`). Dense bf16 by default; `spec.quantize` (Q4/Q8) quantizes the whole model in place
+/// after the dense load. `spec.adapters` (user LoRA/LoKr) apply onto the conditional DiT after the
+/// quantize, via the shared strict loader. A precision override is not wired and is rejected
+/// rather than silently ignored.
+pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    if spec.precision != Precision::Bf16 {
+        return Err(Error::Msg(
+            "ideogram_4: only dense bf16 is wired (drop the precision override)".into(),
+        ));
+    }
+    // Fail-fast the single-file source up front for BOTH policies (Sequential defers the component
+    // build, but a single-file source is still wrong).
+    snapshot_dir(spec, IDEOGRAM_4_ID)?;
+    warn_if_sequential_requantize(spec, IDEOGRAM_4_ID);
+    Ok(Box::new(Ideogram4 {
+        descriptor: descriptor(),
+        turbo: false,
+        residency: build_residency(spec, false)?,
+    }))
+}
+
+/// Construct an [`Ideogram4`] **turbo** generator (issue #488) from a [`LoadSpec`]. `spec.weights`
+/// must be a [`WeightsSource::Dir`] pointing at a turbo snapshot — the conditional `transformer/`,
+/// `text_encoder/`, `vae/`, `tokenizer/`, plus the bundled [`TURBO_LORA_FILE`]; the unconditional
+/// DiT is not loaded. The heavy loader loads the single DiT, quantizes (Q4/Q8) if requested, then
+/// installs the TurboTime LoRA at scale 1.0 — the CFG-free few-step path. `spec.adapters` (user
+/// LoRA/LoKr) stack AFTER the bundled TurboTime LoRA, onto the same conditional DiT. A precision
+/// override is rejected.
+pub fn load_turbo(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    if spec.precision != Precision::Bf16 {
+        return Err(Error::Msg(
+            "ideogram_4_turbo: only dense bf16 is wired (drop the precision override)".into(),
+        ));
+    }
+    let root = snapshot_dir(spec, IDEOGRAM_4_TURBO_ID)?;
+    // Fail-fast the missing bundled LoRA up front (the model-defining component) for both policies.
+    let lora_path = root.join(TURBO_LORA_FILE);
+    if !lora_path.exists() {
+        return Err(Error::Msg(format!(
+            "ideogram_4_turbo: bundled TurboTime LoRA not found at {} (a turbo snapshot must \
+             include {TURBO_LORA_FILE})",
+            lora_path.display()
+        )));
+    }
+    warn_if_sequential_requantize(spec, IDEOGRAM_4_TURBO_ID);
+    Ok(Box::new(Ideogram4 {
+        descriptor: descriptor_turbo(),
+        turbo: true,
+        residency: build_residency(spec, true)?,
+    }))
+}
+
+/// Resolve the snapshot directory from the load spec, rejecting a single-file source. Shared by the
+/// entry points' fail-fast and the `Sequential` per-phase loaders.
+fn snapshot_dir<'a>(spec: &'a LoadSpec, id: &str) -> Result<&'a Path> {
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p),
+        WeightsSource::File(_) => Err(Error::Msg(format!(
+            "{id} expects a snapshot directory (transformer/ unconditional_transformer/ \
+             text_encoder/ vae/ tokenizer/), not a single .safetensors file"
+        ))),
+    }
+}
+
+/// F-181: Ideogram quantizes the whole model DENSE at load, so a `Sequential` + `quantize` load
+/// re-quantizes it on EVERY generate (repeated compute; the dense transient shrinks the memory win).
+/// Warn for that combination (no-op for `Resident` or an unquantized load).
+fn warn_if_sequential_requantize(spec: &LoadSpec, id: &str) {
+    if let Some(q) = spec.quantize {
+        if matches!(spec.offload_policy, OffloadPolicy::Sequential) {
+            mlx_gen::residency::warn_sequential_requantize(id, q.bits());
+        }
+    }
+}
+
+/// The policy→[`Residency`] dispatch both Ideogram ids share (sc-10840), routed through the single
+/// [`Residency::from_policy`] seam (F-180). `Resident` eager-loads the Qwen3-VL TE phase + heavy
+/// bundle now (the heavy loader with `use_pid = true`, loading any PiD overlay once and reusing it);
+/// `Sequential` captures the two per-phase loaders and loads nothing now, deferring each to
+/// [`Residency::run`]. Both use the same [`Ideogram4Text::load`] / [`load_heavy_owned`], so the
+/// `Resident` composition is byte-identical to the pre-seam whole-model load (independent weight
+/// files, deterministic RNG-free quant + LoRA merge). Weight-free-testable: under `Sequential` this
+/// touches no component weights, so a dispatch that ignored `offload_policy` would eager-load and
+/// fail the "Sequential defers" unit test.
+pub(crate) fn build_residency(
+    spec: &LoadSpec,
+    turbo: bool,
+) -> Result<Residency<Ideogram4Text, Ideogram4HeavyOwned>> {
+    let spec_text = spec.clone();
+    let spec_heavy = spec.clone();
+    let id = if turbo {
+        IDEOGRAM_4_TURBO_ID
+    } else {
+        IDEOGRAM_4_ID
+    };
+    Residency::from_policy(
+        spec.offload_policy,
+        move || {
+            let root = snapshot_dir(&spec_text, id)?;
+            let mut text = Ideogram4Text::load(root)?;
+            // Q4/Q8 quantizes the Qwen3-VL encoder in place after the dense load (the heavy DiTs + VAE
+            // quantize in `load_heavy_owned`). Deterministic, so byte-identical across residencies.
+            if let Some(q) = spec_text.quantize {
+                text.quantize(q.bits())?;
+            }
+            Ok(text)
+        },
+        move |use_pid| {
+            let root = snapshot_dir(&spec_heavy, id)?;
+            load_heavy_owned(&spec_heavy, root, turbo, use_pid)
+        },
+    )
+}
+
+/// Load the heavy render bundle — the two DiTs + VAE (+ optional PiD overlay), everything but the text
+/// encoder. Quality mode loads both DiTs; turbo loads the single conditional DiT and installs the
+/// bundled TurboTime LoRA AFTER the Q4/Q8 quantize (fork-faithful: the residual is added over the
+/// possibly-quantized base). The PiD student is loaded only when `use_pid` (F-177) — Resident passes
+/// `true` (loaded once, reused), Sequential passes `req.use_pid` so a non-PiD generate skips it.
+fn load_heavy_owned(
+    spec: &LoadSpec,
+    root: &Path,
+    turbo: bool,
+    use_pid: bool,
+) -> Result<Ideogram4HeavyOwned> {
+    let mut heavy = if turbo {
+        Ideogram4Heavy::load_turbo(root)?
+    } else {
+        Ideogram4Heavy::load(root)?
+    };
+    if let Some(q) = spec.quantize {
+        heavy.quantize(q.bits())?;
+    }
+    if turbo {
+        heavy.apply_adapters(&[AdapterSpec {
+            path: root.join(TURBO_LORA_FILE),
+            scale: TURBO_LORA_SCALE,
+            kind: AdapterKind::Lora,
+            pass_scales: None,
+            moe_expert: None,
+        }])?;
+    }
+    // User LoRA/LoKr adapters, onto the conditional DiT — after the quantize (residual over the
+    // possibly-quantized base) and, on turbo, stacked after the bundled TurboTime LoRA. No-op for
+    // an empty list.
+    heavy.apply_adapters(&spec.adapters)?;
+    let pid = if use_pid { load_pid(spec)? } else { None };
+    Ok(Ideogram4HeavyOwned { heavy, pid })
+}
+
+/// Resolve the optional PiD decoder overlay (epic 7840, sc-7847) from `spec.pid`: load the shared
+/// `flux2` student + Gemma caption encoder once. Ideogram 4 is the FLUX.2 VAE latent space, so it
+/// reuses the same student as flux2/lens. `None` (the default) when the spec carries no PiD weights.
+fn load_pid(spec: &LoadSpec) -> Result<Option<PidEngine>> {
+    spec.pid
+        .as_ref()
+        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
+        .transpose()
+}
+
+mlx_gen::impl_generator!(Ideogram4 {
+    validate: |s, req| validate_request(&s.descriptor.capabilities, req),
+    generate: generate_impl,
+});
+
+impl Ideogram4 {
+    /// The rich-`Result` body behind [`Generator::generate`] — kept on the crate's own
+    /// [`mlx_gen::Error`] so `?` lifts `mlx_rs` device exceptions transparently; the trait wrapper
+    /// bridges the tail into [`gen_core::Error`] (epic 3720).
+    /// The staged residency lifecycle (tokenize + Qwen3-VL encode → **drop the TE** under `Sequential`
+    /// → load the two DiTs + VAE + optional PiD → edit-prep/denoise/decode → free the heavy bundle) is
+    /// driven by the shared [`Residency::run`] seam (sc-10840), which owns the eval/drop/clear
+    /// discipline, the stage-boundary cancel checks, and the error-safe cache flush.
+    fn generate_impl(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        validate_request(&self.descriptor.capabilities, req)?;
+
+        // Turbo defaults to the few-step count; quality mode to the 48-step preset. `guidance` is
+        // inert in turbo (the heavy bundle runs CFG-free when the unconditional DiT is absent).
+        let default_steps = if self.turbo {
+            DEFAULT_TURBO_STEPS
+        } else {
+            DEFAULT_STEPS
+        };
+        let steps = req.steps.unwrap_or(default_steps) as usize;
+        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        let base_seed = req.seed.unwrap_or_else(default_seed);
+        // Edit (img2img / inpaint): resolve a source `Reference` (+ optional `Mask`); the VAE encode
+        // happens in the heavy render closure (the VAE is a heavy-phase component). `None` → T2I.
+        let edit = resolve_edit(req)?;
+
+        self.residency.run(
+            &req.cancel,
+            req.use_pid,
+            on_progress,
+            // ── Phase A: tokenize + Qwen3-VL encode → prompt embeds. Seed-independent; under
+            // `Sequential` the shared seam materializes the embeds + DROPS the TE before the DiT/VAE
+            // load — bounding peak to `max(TE, DiTs+VAE)`. The JSON caption is identical across the
+            // count loop, so encoding once is byte-identical to the pre-seam per-image re-encode.
+            |text: &Ideogram4Text| {
+                let ids = text.tokenize(&req.prompt)?;
+                text.encode(&ids)
+            },
+            // Materialize the Qwen3-VL embeds while the encoder is still alive (Sequential only).
+            |te_out: Option<&Array>| {
+                let Some(te_out) = te_out else { return Ok(()) };
+                mlx_rs::transforms::eval([te_out])?;
+                Ok(())
+            },
+            // ── Phase B: edit prep (VAE) + PiD plan + the count loop of denoise/decode over the two
+            // DiTs + VAE (+ optional PiD). Identical body for both residencies.
+            |heavy_owned: &Ideogram4HeavyOwned, te_out, on_progress: &mut dyn FnMut(Progress)| {
+                let heavy = &heavy_owned.heavy;
+
+                // VAE-encode the img2img/inpaint source once (seed-independent). `None` → T2I.
+                let edit_init = match edit {
+                    Some((source, mask, strength)) => {
+                        Some(heavy.prepare_edit(source, mask, strength, req.height, req.width)?)
+                    }
+                    None => None,
+                };
+
+                // PiD decode overlay (epic 7840, sc-7847) + `from_ldm` early-stop (sc-8048): one decoder
+                // serves the whole count loop (same prompt). Errors if `req.use_pid` but the model wasn't
+                // loaded with `LoadSpec::pid`; `None` → the byte-exact native VAE path. Ideogram's
+                // `LogitNormalSchedule` is *inverted* (larger `eval` = cleaner), so `fromldm_capture`
+                // converts the executed σ trajectory into the standard descending flow-match frame PiD
+                // expects (`σ = 1 − eval`; `vp_frame=false`) before resolving the plan. `None`/no-benefit
+                // → clean σ=0, full range, byte-identical.
+                let (capture_sigma, run_from) = heavy
+                    .fromldm_capture(
+                        req.height,
+                        req.width,
+                        steps,
+                        edit_init.as_ref().map(|e| e.strength),
+                        req.use_pid.then_some(req.pid_capture_sigma).flatten(),
+                    )
+                    .map_or((0.0, 0), |(sigma, from)| (sigma, from));
+                let pid_decoder = resolve_pid_decoder_at_sigma(
+                    heavy_owned.pid.as_ref(),
+                    req,
+                    base_seed,
+                    self.descriptor.id,
+                    capture_sigma,
+                )?;
+                let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+
+                let mut images = Vec::with_capacity(req.count as usize);
+                for n in 0..req.count {
+                    let seed = base_seed.wrapping_add(n as u64);
+                    let arr = heavy.run_denoise_from_embeds_with_preview(
+                        &te_out,
+                        req.height,
+                        req.width,
+                        steps,
+                        guidance,
+                        seed,
+                        edit_init.as_ref(),
+                        run_from,
+                        pid_ref,
+                        &req.cancel,
+                        on_progress,
+                        &req.preview,
+                    )?;
+                    images.push(array_to_image(&arr)?);
+                }
+                Ok(GenerationOutput::Images(images))
+            },
+        )
+    }
+}
+
+/// Resolve the optional edit conditioning: a single img2img/inpaint source [`Conditioning::Reference`]
+/// plus an optional [`Conditioning::Mask`]. Returns `(source, mask, strength)`; `None` for pure
+/// text-to-image. A per-reference strength wins over `req.strength`, else the img2img/inpaint
+/// default. More than one `Reference`/`Mask`, or a `Mask` without a `Reference`, is an error.
+fn resolve_edit(req: &GenerationRequest) -> Result<Option<(&Image, Option<&Image>, f32)>> {
+    let mut source: Option<(&Image, Option<f32>)> = None;
+    let mut mask: Option<&Image> = None;
+    for c in &req.conditioning {
+        match c {
+            Conditioning::Reference { image, strength } => {
+                if source.is_some() {
+                    return Err(Error::Msg(
+                        "ideogram_4: only one reference (source) image is supported for edit"
+                            .into(),
+                    ));
+                }
+                source = Some((image, strength.or(req.strength)));
+            }
+            Conditioning::Mask { image } => {
+                if mask.is_some() {
+                    return Err(Error::Msg(
+                        "ideogram_4: only one inpaint mask is supported".into(),
+                    ));
+                }
+                mask = Some(image);
+            }
+            // Other conditioning kinds are rejected by the capability floor in `validate_request`.
+            _ => {}
+        }
+    }
+    match source {
+        Some((image, strength)) => {
+            let default = if mask.is_some() {
+                DEFAULT_INPAINT_STRENGTH
+            } else {
+                DEFAULT_IMG2IMG_STRENGTH
+            };
+            Ok(Some((image, mask, strength.unwrap_or(default))))
+        }
+        None if mask.is_some() => Err(Error::Msg(
+            "ideogram_4: an inpaint mask requires a reference (source) image".into(),
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Capability-driven request validation, factored out so it can be unit-tested without loaded
+/// weights. Layers Ideogram's model-specific constraints (non-empty prompt, size multiple-of-16,
+/// aspect ≤ 6:1, steps ≥ 1) on top of the shared [`Capabilities::validate_request`] floor
+/// (count/size range, negative/guidance/true_cfg flags, conditioning kinds).
+pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
+    if req.prompt.is_empty() {
+        return Err(Error::Msg(
+            "ideogram_4: prompt must not be empty (Ideogram 4 expects a JSON caption)".into(),
+        ));
+    }
+    // `?` converts the shared floor's `gen_core::Error` into the crate's `Error` (From impl).
+    caps.validate_request(MODEL_ID, req)?;
+    if req.steps == Some(0) {
+        return Err(Error::Msg("ideogram_4: steps must be >= 1".into()));
+    }
+    // The pipeline needs dims divisible by patch(2) × ae_scale(8) = 16, or `patchify`'s reshape
+    // blows up deep in MLX — reject at the boundary.
+    if !req.width.is_multiple_of(RES_MULTIPLE) || !req.height.is_multiple_of(RES_MULTIPLE) {
+        return Err(Error::Msg(format!(
+            "ideogram_4: {}x{} must be a multiple of {RES_MULTIPLE}",
+            req.width, req.height
+        )));
+    }
+    let (long, short) = (req.width.max(req.height), req.width.min(req.height));
+    if long > short * MAX_ASPECT {
+        return Err(Error::Msg(format!(
+            "ideogram_4: aspect ratio of {}x{} exceeds the supported {MAX_ASPECT}:1",
+            req.width, req.height
+        )));
+    }
+    // Edit: an inpaint `Mask` is meaningless without a source `Reference` to keep/blend against
+    // (the capability floor admits both kinds individually; this enforces the pairing). Multiple
+    // references / masks are caught in `resolve_edit` at generate time.
+    let has_ref = req
+        .conditioning
+        .iter()
+        .any(|c| matches!(c, Conditioning::Reference { .. }));
+    let has_mask = req
+        .conditioning
+        .iter()
+        .any(|c| matches!(c, Conditioning::Mask { .. }));
+    if has_mask && !has_ref {
+        return Err(Error::Msg(
+            "ideogram_4: an inpaint mask requires a reference (source) image".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Host-extract the pipeline's `[H, W, 3]` u8 RGB array into an [`Image`]. The array is already
+/// `Uint8` (the `run_denoise` output), so the bytes are read directly (F-110) — the prior
+/// `Uint8 → Int32 → host i32 → u8` round-trip copied 4× the host bytes for no reason.
+fn array_to_image(img: &Array) -> Result<Image> {
+    let sh = img.shape();
+    let (h, w) = (sh[0] as u32, sh[1] as u32);
+    let pixels = img
+        .as_dtype(Dtype::Uint8)?
+        .try_as_slice::<u8>()
+        .map(<[u8]>::to_vec)
+        .map_err(|e| Error::Msg(format!("ideogram: image array not readable as u8: {e}")))?;
+    Ok(Image {
+        width: w,
+        height: h,
+        pixels,
+    })
+}
+
+// The registration constants bridge the crate's rich `Result` into backend-neutral
+// `gen_core::Result`. The turbo variant
+// (issue #488) registers under `ideogram_4_turbo`.
+/// Per-component on-disk footprint (sc-10894) for the MLX fit-gate's staged-residency split — the
+/// Qwen3-VL text encoder (`text_encoder/`), the DiT (`transformer/` + the base id's asymmetric-CFG
+/// `unconditional_transformer/` negative branch), and the VAE (`vae/`), summed from the exact snapshot
+/// subdirs [`crate::loader`] loads. `unconditional_transformer/` is absent for the turbo id (→ 0).
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    mlx_gen::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["text_encoder"],
+        &["transformer", "unconditional_transformer"],
+        &["vae"],
+    )
+}
+
+mlx_gen::register_generators! {
+    pub(crate) const QUALITY_REGISTRATION = descriptor => load;
+    footprint = component_footprint
+}
+mlx_gen::register_generators! {
+    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo;
+    footprint = component_footprint
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caps() -> Capabilities {
+        descriptor().capabilities
+    }
+
+    /// A valid request with a (stand-in) JSON-caption prompt.
+    fn req(w: u32, h: u32) -> GenerationRequest {
+        GenerationRequest {
+            prompt: r#"{"high_level_description":"a fox"}"#.into(),
+            width: w,
+            height: h,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn descriptor_is_ideogram_4() {
+        let d = descriptor();
+        assert_eq!(d.id, "ideogram_4");
+        assert_eq!(d.family, "ideogram");
+        assert_eq!(d.backend, "mlx");
+        assert_eq!(d.modality, Modality::Image);
+        assert!(d.capabilities.supports_guidance);
+        assert!(!d.capabilities.supports_negative_prompt);
+        // Edit surface (sc-6303/6330): img2img Reference + inpaint Mask.
+        assert!(d
+            .capabilities
+            .conditioning
+            .contains(&ConditioningKind::Reference));
+        assert!(d
+            .capabilities
+            .conditioning
+            .contains(&ConditioningKind::Mask));
+        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+        assert_eq!(
+            (d.capabilities.min_size, d.capabilities.max_size),
+            (256, 2048)
+        );
+    }
+
+    #[test]
+    fn validate_accepts_in_surface() {
+        assert!(validate_request(&caps(), &req(1024, 1024)).is_ok());
+        // Exactly 6:1 is allowed (1536 / 256 = 6).
+        assert!(validate_request(&caps(), &req(256, 1536)).is_ok());
+        // guidance is supported.
+        assert!(validate_request(
+            &caps(),
+            &GenerationRequest {
+                guidance: Some(7.0),
+                ..req(512, 512)
+            }
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_prompt() {
+        let e = validate_request(&caps(), &GenerationRequest::default())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("empty"), "got: {e}");
+    }
+
+    #[test]
+    fn validate_rejects_non_multiple_of_16() {
+        // sc-12612: `RES_MULTIPLE` is the pinned stride SceneWorks ties every advertised Ideogram
+        // bucket to. Pin the value and mutation-check that a size which is a multiple of 8 (the VAE
+        // scale) but not RES_MULTIPLE (16) — e.g. 1000×1000 = 125×8 — is rejected with the stride error.
+        assert_eq!(RES_MULTIPLE, 16);
+        for (w, h) in [(1000, 1000), (257, 256), (512, 520)] {
+            let e = validate_request(&caps(), &req(w, h))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("multiple of 16"), "{w}x{h} got: {e}");
+        }
+        // An on-stride, in-range size passes.
+        assert!(validate_request(&caps(), &req(1024, 1024)).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_size() {
+        assert!(validate_request(&caps(), &req(128, 128)).is_err()); // below min
+        assert!(validate_request(&caps(), &req(2064, 256)).is_err()); // above max
+    }
+
+    #[test]
+    fn validate_rejects_excessive_aspect() {
+        // 1792 / 256 = 7:1 (> 6:1); in range and a multiple of 16, so only the aspect guard fires.
+        let e = validate_request(&caps(), &req(256, 1792))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("aspect"), "got: {e}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_steps_and_negative_prompt() {
+        assert!(validate_request(
+            &caps(),
+            &GenerationRequest {
+                steps: Some(0),
+                ..req(512, 512)
+            }
+        )
+        .is_err());
+        assert!(validate_request(
+            &caps(),
+            &GenerationRequest {
+                negative_prompt: Some("x".into()),
+                ..req(512, 512)
+            }
+        )
+        .is_err());
+    }
+
+    fn img(w: u32, h: u32) -> Image {
+        Image {
+            width: w,
+            height: h,
+            pixels: vec![0u8; (w * h * 3) as usize],
+        }
+    }
+
+    #[test]
+    fn validate_accepts_img2img_reference() {
+        // Edit surface (sc-6303): a single img2img source Reference is now accepted.
+        let r = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: img(512, 512),
+                strength: Some(0.7),
+            }],
+            ..req(512, 512)
+        };
+        assert!(validate_request(&caps(), &r).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_inpaint_reference_plus_mask() {
+        let r = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: img(512, 512),
+                    strength: None,
+                },
+                Conditioning::Mask {
+                    image: img(512, 512),
+                },
+            ],
+            ..req(512, 512)
+        };
+        assert!(validate_request(&caps(), &r).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_mask_without_reference() {
+        let r = GenerationRequest {
+            conditioning: vec![Conditioning::Mask {
+                image: img(512, 512),
+            }],
+            ..req(512, 512)
+        };
+        let e = validate_request(&caps(), &r).unwrap_err().to_string();
+        assert!(e.contains("requires a reference"), "got: {e}");
+    }
+
+    #[test]
+    fn validate_rejects_unsupported_conditioning() {
+        // A control/pose conditioning is out of surface → rejected by the capability floor.
+        let r = GenerationRequest {
+            conditioning: vec![Conditioning::Control {
+                image: img(512, 512),
+                kind: mlx_gen::ControlKind::Pose,
+                scale: Some(1.0),
+            }],
+            ..req(512, 512)
+        };
+        assert!(validate_request(&caps(), &r).is_err());
+    }
+
+    #[test]
+    fn resolve_edit_defaults_and_pairing() {
+        // No conditioning → no edit.
+        assert!(resolve_edit(&req(512, 512)).unwrap().is_none());
+        // Reference only → img2img with the img2img default strength.
+        let r = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: img(512, 512),
+                strength: None,
+            }],
+            ..req(512, 512)
+        };
+        let (_, mask, strength) = resolve_edit(&r).unwrap().expect("edit");
+        assert!(mask.is_none());
+        assert_eq!(strength, DEFAULT_IMG2IMG_STRENGTH);
+        // Reference + Mask → inpaint default strength; per-reference strength wins when present.
+        let r = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: img(512, 512),
+                    strength: None,
+                },
+                Conditioning::Mask {
+                    image: img(512, 512),
+                },
+            ],
+            ..req(512, 512)
+        };
+        let (_, mask, strength) = resolve_edit(&r).unwrap().expect("edit");
+        assert!(mask.is_some());
+        assert_eq!(strength, DEFAULT_INPAINT_STRENGTH);
+        // A second Reference is an error.
+        let r = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: img(512, 512),
+                    strength: None,
+                },
+                Conditioning::Reference {
+                    image: img(512, 512),
+                    strength: None,
+                },
+            ],
+            ..req(512, 512)
+        };
+        assert!(resolve_edit(&r).is_err());
+    }
+
+    #[test]
+    fn load_rejects_single_file_source() {
+        let spec = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
+        // `Box<dyn Generator>` isn't Debug → use `.err()`.
+        let e = load(&spec).err().expect("expected an error").to_string();
+        assert!(e.contains("snapshot directory"), "got: {e}");
+    }
+
+    #[test]
+    fn load_accepts_quant_spec() {
+        // Q4/Q8 is wired (whole model) — a quant spec must get past the entry point and fail later
+        // on the missing snapshot, not be rejected as unsupported.
+        for q in [Quant::Q4, Quant::Q8] {
+            let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(q);
+            let e = load(&spec).err().expect("expected an error").to_string();
+            assert!(
+                !e.contains("not yet wired"),
+                "quant should be accepted: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn reachable_via_registry_by_id() {
+        // The family catalog must resolve ideogram_4 to this loader; a nonexistent dir fails inside
+        // load, not with "no generator registered".
+        assert!(crate::provider_registry()
+            .unwrap()
+            .generators()
+            .copied()
+            .any(|r| (r.descriptor)().id == MODEL_ID));
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-ideogram".into()));
+        let e = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .err()
+            .expect("missing weights → err")
+            .to_string();
+        assert!(
+            !e.contains("no generator registered"),
+            "id not resolved: {e}"
+        );
+    }
+
+    // ── Turbo variant (issue #488) ────────────────────────────────────────────────────────
+
+    #[test]
+    fn descriptor_turbo_is_cfg_free_else_matches_base() {
+        let (b, t) = (descriptor(), descriptor_turbo());
+        assert_eq!(t.id, "ideogram_4_turbo");
+        assert_eq!(t.family, b.family);
+        assert_eq!(t.backend, b.backend);
+        assert_eq!(t.modality, b.modality);
+        // The one capability that differs: turbo is CFG-free (no unconditional DiT to mix against).
+        assert!(b.capabilities.supports_guidance);
+        assert!(!t.capabilities.supports_guidance);
+        // Everything else is identical to the base surface.
+        assert_eq!(
+            t.capabilities.supports_negative_prompt,
+            b.capabilities.supports_negative_prompt
+        );
+        assert_eq!(
+            t.capabilities.supported_quants,
+            b.capabilities.supported_quants
+        );
+        assert_eq!(
+            (t.capabilities.min_size, t.capabilities.max_size),
+            (b.capabilities.min_size, b.capabilities.max_size)
+        );
+        assert!(t.capabilities.mac_only);
+    }
+
+    #[test]
+    fn load_turbo_rejects_single_file_source() {
+        let spec = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
+        let e = load_turbo(&spec)
+            .err()
+            .expect("expected an error")
+            .to_string();
+        assert!(e.contains("snapshot directory"), "got: {e}");
+    }
+
+    #[test]
+    fn load_accepts_user_adapter_specs() {
+        // User adapters are wired (supports_lora advertisement): a spec carrying one must get PAST
+        // the old up-front rejection on both entry points — weight-free, so the load still errors,
+        // but on the missing snapshot, never on "adapters are not supported".
+        let adapters = vec![AdapterSpec {
+            path: "/tmp/user.safetensors".into(),
+            scale: 1.0,
+            kind: AdapterKind::Lora,
+            pass_scales: None,
+            moe_expert: None,
+        }];
+        for f in [load, load_turbo] {
+            let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+                .with_adapters(adapters.clone());
+            // Still errors (no weights on disk) — but on the load, never the old adapter gate.
+            let e = f(&spec).err().expect("expected an error").to_string();
+            assert!(!e.contains("not supported"), "adapter gate resurfaced: {e}");
+        }
+    }
+
+    #[test]
+    fn load_turbo_errors_when_bundled_lora_missing() {
+        // A dir with no turbo_lora.safetensors must fail loudly on the missing bundled LoRA (the
+        // model-defining component), not silently fall back to a CFG render.
+        // Per-process scratch dir: the "no turbo_lora.safetensors here" premise must not be broken by
+        // a second concurrent `cargo test` process writing into the shared `$TMPDIR`.
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
+        let spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
+        let e = load_turbo(&spec)
+            .err()
+            .expect("expected an error")
+            .to_string();
+        assert!(
+            e.contains("turbo_lora.safetensors") || e.contains("TurboTime LoRA not found"),
+            "got: {e}"
+        );
+    }
+
+    #[test]
+    fn turbo_reachable_via_registry_by_id() {
+        assert!(crate::provider_registry()
+            .unwrap()
+            .generators()
+            .copied()
+            .any(|r| (r.descriptor)().id == MODEL_ID_TURBO));
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-ideogram-turbo".into()));
+        let e = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID_TURBO, &spec)
+            .err()
+            .expect("missing weights → err")
+            .to_string();
+        assert!(
+            !e.contains("no generator registered"),
+            "turbo id not resolved: {e}"
+        );
+    }
+
+    // ── Sequential residency (epic 10834, sc-10840): weight-free proof the dispatch HONORS
+    // `offload_policy`. `build_residency` points at a non-existent snapshot dir; the discriminator is
+    // deferral:
+    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
+    //   * `Resident` eager-loads the Qwen3-VL TE from the missing dir → `Err`.
+    // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
+    // request and fail the first assertion. The real-weights A/B is `#[ignore]`d; this runs by default.
+    fn missing_snapshot_spec(policy: mlx_gen::OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/ideogram-residency-test-snapshot".into(),
+        ))
+        .with_offload_policy(policy)
+    }
+
+    #[test]
+    fn build_residency_sequential_defers_all_component_loads() {
+        // Both ids share the one dispatch — assert on the quality (non-turbo) id.
+        let res = build_residency(
+            &missing_snapshot_spec(mlx_gen::OffloadPolicy::Sequential),
+            false,
+        )
+        .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential (deferred) residency"
+        );
+    }
+
+    #[test]
+    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
+        let err = build_residency(
+            &missing_snapshot_spec(mlx_gen::OffloadPolicy::Resident),
+            false,
+        )
+        .err()
+        .expect("Resident must eager-load and fail on a missing snapshot dir");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("single .safetensors file"),
+            "expected an eager-load failure, not the up-front single-file guard: {msg}"
+        );
+    }
+
+    #[test]
+    fn descriptors_advertise_sequential_offload() {
+        // Both ids honor the shared Residency seam (the descriptor bit consumers read).
+        for d in [descriptor(), descriptor_turbo()] {
+            assert!(
+                d.capabilities.supports_sequential_offload,
+                "{} must advertise supports_sequential_offload",
+                d.id
+            );
+        }
+    }
+}

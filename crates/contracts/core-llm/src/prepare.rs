@@ -1,0 +1,506 @@
+//! Persisted, backend-neutral model snapshot preparation (story 7659).
+//!
+//! Turning a downloaded model into something the engine can load has two parts: *deciding* what to
+//! do (which format is this? does it need converting? quantize or not?) and *doing the tensor work*
+//! (dequantize, re-quantize, serialize). This module owns the first part and **delegates the second
+//! to an explicitly selected backend**, exactly as [`registry`](crate::registry) owns provider
+//! routing while the backend owns the decode.
+//!
+//! A caller hands [`SnapshotPreparerRegistry::prepare_snapshot`] a [`PrepareSpec`] — an
+//! already-downloaded source (an HF-safetensors snapshot directory or a `*.gguf` file; fetching it
+//! is the caller's job, this crate has no network), an output directory, and one quantization knob —
+//! and gets back a persisted, loadable snapshot that
+//! [`TextLlmRegistry::load_for_model`](crate::registry::TextLlmRegistry::load_for_model) consumes.
+//! The backend is selected from the registry by a cheap, weightless probe, mirroring
+//! [`can_load`](crate::registry::TextLlmRegistration::can_load).
+//!
+//! `core-llm` stays **tensor-free**: it detects the on-disk format, routes to a backend, validates,
+//! and reports — it never touches a weight. The quantization invariant it documents (and the backend
+//! enforces) is that only attention/MLP **projection** weights are quantized; embeddings, the LM
+//! head, and norms stay dense. That is a tensor-level rule, so it is architecture-agnostic.
+
+use crate::error::{Error, Result};
+use crate::request::Quantize;
+use std::path::{Path, PathBuf};
+
+/// The on-disk format of a model source, detected from bytes and layout only — never the model
+/// architecture (`core-llm` does not interpret architectures; the backend does).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelFormat {
+    /// A llama.cpp `*.gguf` container (a single file beginning with the `GGUF` magic).
+    Gguf,
+    /// A Hugging Face-shaped snapshot: a directory with `config.json` (+ `*.safetensors` shards), or
+    /// a bare `*.safetensors` file.
+    Safetensors,
+}
+
+impl ModelFormat {
+    /// A short lowercase tag for diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelFormat::Gguf => "gguf",
+            ModelFormat::Safetensors => "safetensors",
+        }
+    }
+}
+
+/// The first four bytes of every `*.gguf` container.
+const GGUF_MAGIC: &[u8; 4] = b"GGUF";
+
+/// Detect the on-disk [`ModelFormat`] of `source` by inspecting bytes and layout only (tensor-free):
+///
+/// - a **file** is GGUF iff it begins with the `GGUF` magic (falling back to a `.gguf` extension when
+///   the bytes can't be read), or a HF snapshot iff it is a `*.safetensors`;
+/// - a **directory** is a HF snapshot iff it holds `config.json`, else GGUF iff it holds a `*.gguf`.
+///
+/// Returns [`Error::Unsupported`] for anything else (a missing path, an empty directory, a stray
+/// file) — never a panic.
+pub fn detect_format(source: &Path) -> Result<ModelFormat> {
+    if source.is_file() {
+        detect_file_format(source)
+    } else if source.is_dir() {
+        detect_dir_format(source)
+    } else {
+        Err(Error::Unsupported(format!(
+            "cannot prepare '{}': path does not exist or is neither a file nor a directory",
+            source.display()
+        )))
+    }
+}
+
+fn detect_file_format(path: &Path) -> Result<ModelFormat> {
+    if file_has_gguf_magic(path) {
+        return Ok(ModelFormat::Gguf);
+    }
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("gguf") => Ok(ModelFormat::Gguf),
+        Some("safetensors") => Ok(ModelFormat::Safetensors),
+        _ => Err(Error::Unsupported(format!(
+            "cannot prepare '{}': not a GGUF (no `GGUF` magic) nor a `*.safetensors` file",
+            path.display()
+        ))),
+    }
+}
+
+fn detect_dir_format(dir: &Path) -> Result<ModelFormat> {
+    if dir.join("config.json").is_file() {
+        return Ok(ModelFormat::Safetensors);
+    }
+    if dir_contains_gguf(dir) {
+        return Ok(ModelFormat::Gguf);
+    }
+    Err(Error::Unsupported(format!(
+        "cannot prepare '{}': directory has no config.json (HF snapshot) and no *.gguf",
+        dir.display()
+    )))
+}
+
+/// Read the first four bytes; `true` iff they are the `GGUF` magic. Any IO error ⇒ `false` (the
+/// caller falls back to the file extension).
+fn file_has_gguf_magic(path: &Path) -> bool {
+    use std::io::Read;
+    let mut buf = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .map(|()| &buf == GGUF_MAGIC)
+        .unwrap_or(false)
+}
+
+fn dir_contains_gguf(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("gguf"))
+        })
+        .unwrap_or(false)
+}
+
+/// A request to materialize a loadable, persisted snapshot from `source` into `out_dir`.
+///
+/// `source` is an already-downloaded model directory or file (fetching it is the caller's
+/// responsibility — `core-llm` has no network). `out_dir` receives the prepared snapshot
+/// (`config.json` + `model.safetensors` + tokenizer files) that
+/// [`TextLlmRegistry::load_for_model`](crate::registry::TextLlmRegistry::load_for_model) consumes.
+/// `quantize` is the single knob: `None` ⇒ a dense snapshot, `Some(_)` ⇒ projections re-quantized to
+/// that scheme on the way out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrepareSpec {
+    /// The downloaded model: an HF-safetensors snapshot directory or a `*.gguf` file/dir.
+    pub source: PathBuf,
+    /// Where the prepared, loadable snapshot is written.
+    pub out_dir: PathBuf,
+    /// Optional load-time-independent quantization baked into the persisted snapshot.
+    pub quantize: Option<Quantize>,
+}
+
+impl PrepareSpec {
+    /// A dense (non-quantized) preparation.
+    pub fn dense(source: impl Into<PathBuf>, out_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            source: source.into(),
+            out_dir: out_dir.into(),
+            quantize: None,
+        }
+    }
+
+    /// A preparation that re-quantizes projections to `quantize`.
+    pub fn quantized(
+        source: impl Into<PathBuf>,
+        out_dir: impl Into<PathBuf>,
+        quantize: Quantize,
+    ) -> Self {
+        Self {
+            source: source.into(),
+            out_dir: out_dir.into(),
+            quantize: Some(quantize),
+        }
+    }
+}
+
+/// What a [`SnapshotPreparerRegistry::prepare_snapshot`] call produced — reported honestly so a
+/// caller (or the conformance suite) sees exactly what was done, including a no-rewrite passthrough.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrepareReport {
+    /// The detected format of the input.
+    pub input_format: ModelFormat,
+    /// The quantization actually baked into the snapshot (`None` ⇒ dense).
+    pub quantized: Option<Quantize>,
+    /// The directory the loadable snapshot is at (equals `spec.source` on a passthrough).
+    pub out_dir: PathBuf,
+    /// Number of weight tensors in the snapshot.
+    pub num_tensors: usize,
+    /// `true` when the source was already a loadable dense snapshot and was returned as-is (the
+    /// backend wrote nothing). Never silently true — surfaced so "prepared" never hides "did
+    /// nothing".
+    pub passthrough: bool,
+}
+
+/// A registered backend snapshot preparer: which sources it can handle (a cheap, weightless probe)
+/// and how to materialize the snapshot (the tensor work). Backends expose one for platform bundles
+/// to compose, exactly as they expose a
+/// [`TextLlmRegistration`](crate::registry::TextLlmRegistration). Stored as `fn` pointers (not a
+/// trait object) because preparation is a stateless one-shot — there is no instance to hold.
+#[derive(Clone, Copy)]
+pub struct SnapshotPreparerRegistration {
+    /// The backend tag for diagnostics (e.g. `"mlx"`, `"candle"`).
+    pub backend: fn() -> &'static str,
+    /// Cheap probe: can this backend prepare `spec.source`? Typically a [`detect_format`] call
+    /// filtered to the formats the backend implements. MUST NOT read weight shards.
+    pub can_prepare: fn(&PrepareSpec) -> bool,
+    /// Materialize the persisted snapshot (dequantize / re-quantize / serialize). The tensor work.
+    pub prepare: fn(&PrepareSpec) -> Result<PrepareReport>,
+}
+
+/// Builder for an ordinary, explicit snapshot-preparer registry.
+///
+/// Runtime bundles add exactly the backend preparers they ship.
+#[derive(Default)]
+pub struct SnapshotPreparerRegistryBuilder {
+    registrations: Vec<SnapshotPreparerRegistration>,
+}
+
+impl SnapshotPreparerRegistryBuilder {
+    /// Start an empty explicit registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a backend preparer, preserving insertion order for deterministic selection.
+    pub fn register(mut self, registration: SnapshotPreparerRegistration) -> Self {
+        self.registrations.push(registration);
+        self
+    }
+
+    /// Add several backend preparers in iterator order.
+    pub fn extend(
+        mut self,
+        registrations: impl IntoIterator<Item = SnapshotPreparerRegistration>,
+    ) -> Self {
+        self.registrations.extend(registrations);
+        self
+    }
+
+    /// Validate backend-name uniqueness and produce the immutable registry.
+    pub fn build(self) -> Result<SnapshotPreparerRegistry> {
+        let mut backends = std::collections::BTreeSet::new();
+        for registration in &self.registrations {
+            let backend = (registration.backend)();
+            if !backends.insert(backend) {
+                return Err(Error::Msg(format!(
+                    "duplicate snapshot preparer backend '{backend}' in explicit registry"
+                )));
+            }
+        }
+        Ok(SnapshotPreparerRegistry {
+            registrations: self.registrations.into_boxed_slice(),
+        })
+    }
+}
+
+/// An immutable, explicit collection of snapshot preparers.
+pub struct SnapshotPreparerRegistry {
+    registrations: Box<[SnapshotPreparerRegistration]>,
+}
+
+impl SnapshotPreparerRegistry {
+    /// Iterate the registry in deterministic insertion order.
+    pub fn registrations(&self) -> impl ExactSizeIterator<Item = &SnapshotPreparerRegistration> {
+        self.registrations.iter()
+    }
+
+    /// Materialize a loadable snapshot through the first accepting bundled backend.
+    pub fn prepare_snapshot(&self, spec: &PrepareSpec) -> Result<PrepareReport> {
+        let registration = select_preparer(self.registrations(), spec)?;
+        (registration.prepare)(spec)
+    }
+}
+
+/// Resolve the preparer to run: the first registered backend whose weightless probe accepts the
+/// source. Pure over the supplied registrations so it is unit-testable without loading a backend.
+fn select_preparer<'a>(
+    regs: impl Iterator<Item = &'a SnapshotPreparerRegistration>,
+    spec: &PrepareSpec,
+) -> Result<&'a SnapshotPreparerRegistration> {
+    let all: Vec<&SnapshotPreparerRegistration> = regs.collect();
+    match all.iter().copied().find(|r| (r.can_prepare)(spec)) {
+        Some(r) => Ok(r),
+        None => Err(Error::Unsupported(no_preparer_msg(spec, &all))),
+    }
+}
+
+/// `backend` summary of a set of registrations, for diagnostics.
+fn preparer_summary(regs: &[&SnapshotPreparerRegistration]) -> String {
+    if regs.is_empty() {
+        return "(none)".to_string();
+    }
+    let mut v: Vec<String> = regs.iter().map(|r| (r.backend)().to_string()).collect();
+    v.sort();
+    v.dedup();
+    v.join(", ")
+}
+
+fn no_preparer_msg(spec: &PrepareSpec, all: &[&SnapshotPreparerRegistration]) -> String {
+    let fmt = match detect_format(&spec.source) {
+        Ok(f) => format!("format={}", f.as_str()),
+        Err(_) => "unrecognized source format".to_string(),
+    };
+    format!(
+        "no linked backend can prepare a snapshot from '{}' ({fmt}); linked preparers: {}",
+        spec.source.display(),
+        preparer_summary(all),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh temp directory for a test, removed on `Drop` (sc-17755).
+    ///
+    /// This used to be a hand-rolled `temp_dir().join(format!("core-llm-prepare-{pid}-{tag}-{n}"))`
+    /// with a process-local counter and no cleanup at all — "mirrors the testkit's process-id
+    /// scheme", as the old comment put it — which leaked one directory per call and had piled up
+    /// 252 of them under `%TEMP%` on the CUDA box. The counter is gone with it: `TempDir` draws its
+    /// suffix from an OS-seeded RNG and makes it unique by exclusive create-and-retry, so a
+    /// recycled PID cannot reopen a previous run's directory.
+    ///
+    /// Callers bind the guard and read `.path()`; letting it drop early would delete the fixture
+    /// out from under the test.
+    fn fixture_dir(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("core-llm-prepare-{tag}-"))
+            .tempdir()
+            .expect("fixture temp dir")
+    }
+
+    /// Guards the sc-17755 fix, and specifically the property the old `{pid}-{tag}-{n}` scheme
+    /// lacked: two calls with the SAME tag get different directories, so a recycled PID cannot
+    /// reopen a previous run's fixture. Both also leave on `Drop`.
+    #[test]
+    fn fixture_dirs_are_unique_per_call_and_removed_on_drop() {
+        let (a, b) = (fixture_dir("dup"), fixture_dir("dup"));
+        let (pa, pb) = (a.path().to_path_buf(), b.path().to_path_buf());
+        assert_ne!(pa, pb, "same tag must not collide");
+        drop(a);
+        assert!(!pa.exists(), "first fixture survived: {}", pa.display());
+        assert!(pb.exists(), "dropping one guard must not disturb the other");
+        drop(b);
+        assert!(!pb.exists(), "second fixture survived: {}", pb.display());
+    }
+
+    fn write(path: &Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn detects_gguf_by_magic_regardless_of_extension() {
+        let guard = fixture_dir("magic");
+        let dir = guard.path();
+        let f = dir.join("model.bin");
+        write(&f, b"GGUF\x00\x00\x00\x03rest");
+        assert_eq!(detect_format(&f).unwrap(), ModelFormat::Gguf);
+    }
+
+    #[test]
+    fn detects_gguf_by_extension_when_unreadable_magic() {
+        let guard = fixture_dir("ext");
+        let dir = guard.path();
+        let f = dir.join("model.gguf");
+        write(&f, b"xx"); // too short for magic, but the extension carries it
+        assert_eq!(detect_format(&f).unwrap(), ModelFormat::Gguf);
+    }
+
+    #[test]
+    fn detects_safetensors_file() {
+        let guard = fixture_dir("st-file");
+        let dir = guard.path();
+        let f = dir.join("model.safetensors");
+        write(&f, b"\x00\x00\x00\x00not-really-but-extension-counts");
+        assert_eq!(detect_format(&f).unwrap(), ModelFormat::Safetensors);
+    }
+
+    #[test]
+    fn detects_hf_snapshot_dir_by_config_json() {
+        let guard = fixture_dir("hf-dir");
+        let dir = guard.path();
+        write(&dir.join("config.json"), b"{\"model_type\":\"llama\"}");
+        write(&dir.join("model.safetensors"), b"\x00");
+        assert_eq!(detect_format(dir).unwrap(), ModelFormat::Safetensors);
+    }
+
+    #[test]
+    fn detects_gguf_dir_by_contained_file() {
+        let guard = fixture_dir("gguf-dir");
+        let dir = guard.path();
+        write(&dir.join("weights.gguf"), b"GGUF\x00\x00\x00\x03");
+        assert_eq!(detect_format(dir).unwrap(), ModelFormat::Gguf);
+    }
+
+    #[test]
+    fn empty_dir_is_unsupported() {
+        let guard = fixture_dir("empty");
+        let dir = guard.path();
+        match detect_format(dir) {
+            Err(Error::Unsupported(m)) => assert!(m.contains("no config.json"), "{m}"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_path_is_unsupported() {
+        // An entry inside the guard, never created: the guard's own root exists.
+        let p_tmp = tempfile::tempdir().unwrap();
+        let p = p_tmp.path().join("definitely-not-here-zzz");
+        match detect_format(&p) {
+            Err(Error::Unsupported(m)) => assert!(m.contains("does not exist"), "{m}"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stray_file_is_unsupported() {
+        let guard = fixture_dir("stray");
+        let dir = guard.path();
+        let f = dir.join("notes.txt");
+        write(&f, b"hello");
+        match detect_format(&f) {
+            Err(Error::Unsupported(_)) => {}
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    // --- select_preparer over throwaway registrations (no global state, no tensor work) ---
+
+    fn mlx_tag() -> &'static str {
+        "mlx"
+    }
+    fn candle_tag() -> &'static str {
+        "candle"
+    }
+    fn yes(_spec: &PrepareSpec) -> bool {
+        true
+    }
+    fn no(_spec: &PrepareSpec) -> bool {
+        false
+    }
+    fn never_prepares(_spec: &PrepareSpec) -> Result<PrepareReport> {
+        Ok(PrepareReport {
+            input_format: ModelFormat::Safetensors,
+            quantized: None,
+            out_dir: PathBuf::from("/unused"),
+            num_tensors: 1,
+            passthrough: false,
+        })
+    }
+    fn reg(
+        backend: fn() -> &'static str,
+        can_prepare: fn(&PrepareSpec) -> bool,
+    ) -> SnapshotPreparerRegistration {
+        SnapshotPreparerRegistration {
+            backend,
+            can_prepare,
+            prepare: never_prepares,
+        }
+    }
+
+    #[test]
+    fn select_picks_the_accepting_backend() {
+        let mlx = reg(mlx_tag, no);
+        let candle = reg(candle_tag, yes);
+        let spec = PrepareSpec::dense("/some/model", "/out");
+        let chosen = select_preparer([&mlx, &candle].into_iter(), &spec).unwrap();
+        assert_eq!((chosen.backend)(), "candle");
+    }
+
+    #[test]
+    fn no_accepting_backend_is_a_typed_unsupported() {
+        let mlx = reg(mlx_tag, no);
+        let candle = reg(candle_tag, no);
+        let spec = PrepareSpec::dense("/some/model", "/out");
+        // Map the Ok side to a printable value (the registration itself isn't `Debug`, matching
+        // `TextLlmRegistration`).
+        match select_preparer([&mlx, &candle].into_iter(), &spec).map(|r| (r.backend)()) {
+            Err(Error::Unsupported(m)) => {
+                assert!(m.contains("no linked backend can prepare"), "{m}");
+                assert!(m.contains("mlx") && m.contains("candle"), "{m}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_registry_routes_without_global_state() {
+        let registry = SnapshotPreparerRegistryBuilder::new()
+            .register(reg(mlx_tag, no))
+            .register(reg(candle_tag, yes))
+            .build()
+            .unwrap();
+        let report = registry
+            .prepare_snapshot(&PrepareSpec::dense("/some/model", "/out"))
+            .unwrap();
+        assert_eq!(report.num_tensors, 1);
+        assert_eq!(registry.registrations().len(), 2);
+    }
+
+    #[test]
+    fn explicit_registry_rejects_duplicate_backends() {
+        let error = SnapshotPreparerRegistryBuilder::new()
+            .register(reg(mlx_tag, no))
+            .register(reg(mlx_tag, yes))
+            .build()
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("duplicate snapshot preparer backend 'mlx'"));
+    }
+
+    #[test]
+    fn spec_constructors_carry_quantize() {
+        assert_eq!(PrepareSpec::dense("a", "b").quantize, None);
+        assert_eq!(
+            PrepareSpec::quantized("a", "b", Quantize::Q4).quantize,
+            Some(Quantize::Q4)
+        );
+    }
+}

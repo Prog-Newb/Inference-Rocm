@@ -1,0 +1,532 @@
+//! `ControlBranch` — the backend-neutral seam shared by every **Fun-Controlnet-Union** /
+//! ControlNet variant (sc-8241, epic 8236).
+//!
+//! A control variant (Z-Image-turbo, FLUX.2-dev, Qwen-Image — and, by design, the forthcoming
+//! FLUX.1-dev branch sc-8238/sc-8239) is the base generator plus a control branch that injects a
+//! VAE-encoded skeleton/depth/canny hint into the backbone's own DiT blocks. The **per-model forward
+//! pass is NOT shareable**: a Fun-Controlnet-Union branch is a partial copy of each backbone's blocks
+//! (FLUX.2 MMDiT / Z-Image no-RoPE MMDiT / Qwen DiT), so the residual/context math lives in the
+//! provider crate. What *was* duplicated near-verbatim across all three crates — and is collapsed
+//! here — is the **boilerplate** around that forward:
+//!
+//! - pulling the base-snapshot dir + the (required) control checkpoint out of a [`LoadSpec`], with
+//!   consistent error messages,
+//! - extracting the single [`Conditioning::Control`] image + its scale from a request (with the
+//!   accepted-kind policy),
+//! - the `validate()` tail that requires a `Control` conditioning be present.
+//!
+//! This trait is **tensor-free** (it touches only gen-core contract types), so it lives in gen-core
+//! alongside [`crate::Generator`] and is implemented by each provider's loaded control struct. The
+//! default
+//! message bodies match the canonical Z-Image port; FLUX.2 / Qwen override only the few methods
+//! whose wording legitimately differs, so the user-facing error text stays **byte-identical** to the
+//! hand-written originals (the `#[ignore]` smokes assert on the substrings these produce).
+//!
+//! The trait surface is deliberately **input-agnostic**: the Fun-Union family has no discrete
+//! control-mode index — pose / canny / depth differ only by the host-side preprocessor, never by a
+//! branch parameter — so there is intentionally no "mode" on this seam. A new backbone (FLUX.1) plugs
+//! in by implementing the same handful of methods; no trait change is required.
+
+use crate::error::{Error, Result};
+use crate::generator::{Conditioning, ControlKind, GenerationRequest};
+use crate::media::Image;
+use crate::runtime::{LoadSpec, WeightsSource};
+use std::path::Path;
+
+/// Which [`ControlKind`]s a control branch accepts. The Fun-Controlnet-Union checkpoints are a
+/// *union* of pose/canny/depth over one VAE-encoded path, so most branches accept
+/// [`AcceptedControlKinds::Any`]; a branch wired for a single signal (e.g. Qwen v1 = pose-only)
+/// restricts to [`AcceptedControlKinds::Only`].
+///
+/// This is the *acceptance policy* for the request-side [`Conditioning::Control`] `kind`, kept on the
+/// trait so the validation collapses into the shared [`ControlBranch::resolve_control`] helper rather
+/// than re-implementing the `kind` check in each provider.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AcceptedControlKinds {
+    /// Any [`ControlKind`] is accepted — the input-agnostic Fun-Union default (pose/canny/depth all
+    /// flow through the same VAE-encoded control path; they differ only by host preprocessor).
+    Any,
+    /// Only these specific kinds are accepted (e.g. Qwen-Image v1 = `[Pose]`); any other is rejected
+    /// at `resolve_control` rather than silently treated as the accepted one.
+    Only(Vec<ControlKind>),
+}
+
+impl AcceptedControlKinds {
+    /// Whether `kind` is admitted by this policy.
+    pub fn accepts(&self, kind: &ControlKind) -> bool {
+        match self {
+            AcceptedControlKinds::Any => true,
+            AcceptedControlKinds::Only(kinds) => kinds.contains(kind),
+        }
+    }
+}
+
+/// The shared engine seam for a ControlNet / Fun-Controlnet-Union variant.
+///
+/// A provider's loaded control struct (`ZImageTurboControl`, `Flux2DevControl`, `QwenImageControl`,
+/// future `Flux1DevControl`) implements this **in addition to** [`crate::Generator`]. The required
+/// methods
+/// supply the per-model identity (id, accepted kinds); the **provided methods** supply all the
+/// boilerplate that used to be copy-pasted across the crates, plus override points for the few
+/// message bodies that legitimately differ per model. Nothing here touches tensors — the per-model
+/// forward, weight load, and `generate` loop stay in the provider crate.
+///
+/// The load-time boilerplate is exposed as the free functions [`require_base_dir`] /
+/// [`require_control`] (not trait methods) for use at the **top of a provider's `load(spec)`**,
+/// before the struct exists (so there is no `&self` yet).
+pub trait ControlBranch: crate::Generator {
+    /// The registry id of this control variant (e.g. `"z_image_turbo_control"`). Woven verbatim into
+    /// the shared error messages so they read identically to the hand-written originals.
+    fn model_id(&self) -> &'static str;
+
+    /// Which control signals this branch admits (see [`AcceptedControlKinds`]).
+    ///
+    /// Reads [`ModelDescriptor::control_kinds`](crate::ModelDescriptor::control_kinds), so the
+    /// weights-free advertisement and the enforced policy are the same value and cannot drift — a
+    /// branch declares its policy on its descriptor rather than overriding here. An undeclared
+    /// descriptor (`None`) falls back to the historical input-agnostic Fun-Union default
+    /// ([`AcceptedControlKinds::Any`]), which is what every branch got before the field existed.
+    fn accepted_control_kinds(&self) -> AcceptedControlKinds {
+        self.descriptor()
+            .control_kinds
+            .clone()
+            .unwrap_or(AcceptedControlKinds::Any)
+    }
+
+    /// The "requires a `Control` conditioning" message (used by both
+    /// [`ControlBranch::resolve_control`] when none is present and
+    /// [`ControlBranch::require_control_present`]). Defaults to the Z-Image/FLUX.2 wording; Qwen
+    /// overrides to its "(pose skeleton)" phrasing.
+    fn missing_control_message(&self) -> String {
+        format!(
+            "{} requires a Control conditioning (the pose/union skeleton)",
+            self.model_id()
+        )
+    }
+
+    /// Extract the single [`Conditioning::Control`] image + its resolved scale from a request, applying
+    /// [`accepted_control_kinds`](Self::accepted_control_kinds). The request-side `scale` is an
+    /// `Option<f32>`: `None` resolves to [`default_control_scale`](Self::default_control_scale) and
+    /// `Some(x)` — including `Some(0.0)`, a deliberately inert branch — is used verbatim (F-085).
+    /// Errors when: a control `kind` is not admitted (rejected, not silently coerced); more than one
+    /// `Control` is present; or none is present (uses [`missing_control_message`](Self::missing_control_message)).
+    fn resolve_control<'a>(&self, req: &'a GenerationRequest) -> Result<(&'a Image, f32)> {
+        let accepted = self.accepted_control_kinds();
+        let mut found = None;
+        for c in &req.conditioning {
+            if let Conditioning::Control { image, kind, scale } = c {
+                if !accepted.accepts(kind) {
+                    // Capability gap (this branch supports only certain control kinds) → typed
+                    // `Unsupported` so the worker / candle gating distinguishes it from a malformed
+                    // request (F-002 / F-008); the "single control image" / "missing control" branches
+                    // below are request-shape errors and stay `Msg`.
+                    return Err(Error::Unsupported(self.unsupported_kind_message(kind)));
+                }
+                if found.is_some() {
+                    return Err(Error::Msg(format!(
+                        "{}: a single control image is supported",
+                        self.model_id()
+                    )));
+                }
+                found = Some((image, scale.unwrap_or_else(|| self.default_control_scale())));
+            }
+        }
+        found.ok_or_else(|| Error::Msg(self.missing_control_message()))
+    }
+
+    /// The control-conditioning scale applied when a request's [`Conditioning::Control`] leaves
+    /// `scale = None` (unset). Defaults to the Fun-Controlnet-Union full-strength `1.0`; a branch with
+    /// a different recommended default (e.g. the FLUX.1 Shakker path uses `0.7`) overrides this. An
+    /// explicit `Some(0.0)` is honoured as an inert branch and never reaches this default.
+    fn default_control_scale(&self) -> f32 {
+        1.0
+    }
+
+    /// The message for a control `kind` rejected by [`accepted_control_kinds`](Self::accepted_control_kinds).
+    /// Only reached when the policy is [`AcceptedControlKinds::Only`]; the default matches Qwen v1's
+    /// "supports pose control only" wording.
+    fn unsupported_kind_message(&self, kind: &ControlKind) -> String {
+        format!(
+            "{} v1 supports pose control only, got {kind:?}",
+            self.model_id()
+        )
+    }
+
+    /// The `validate()` tail shared by every control variant: a [`Conditioning::Control`] must be
+    /// present (the capability floor — the provider's `validate_request` — runs just before this).
+    fn require_control_present(&self, req: &GenerationRequest) -> Result<()> {
+        if !req
+            .conditioning
+            .iter()
+            .any(|c| matches!(c, Conditioning::Control { .. }))
+        {
+            return Err(Error::Msg(self.control_present_message()));
+        }
+        Ok(())
+    }
+
+    /// The message for [`require_control_present`](Self::require_control_present) when no `Control`
+    /// is present. Defaults to [`missing_control_message`](Self::missing_control_message); Qwen
+    /// overrides to its "(pose skeleton) conditioning" phrasing (which differs slightly from its
+    /// resolve message — preserved byte-for-byte).
+    fn control_present_message(&self) -> String {
+        self.missing_control_message()
+    }
+}
+
+/// Free-function form of "extract the base snapshot dir or error", for use at the top of a provider's
+/// `load(spec)` (before the control struct exists, so there is no `&self`).
+///
+/// Returns the snapshot directory [`Path`], or an [`Error::Msg`] that names `model_id` and reads
+/// identically to the hand-written loaders. `dir_label` is the model's own description of the
+/// expected directory (Z-Image/Qwen: `"a base snapshot directory"`; FLUX.2: `"a FLUX.2-dev snapshot
+/// directory"`), so the wording stays byte-identical. The existing `load_rejects_single_file_base`
+/// smokes assert on the `"snapshot directory"` substring this produces.
+pub fn require_base_dir<'a>(
+    spec: &'a LoadSpec,
+    model_id: &str,
+    dir_label: &str,
+) -> Result<&'a Path> {
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p.as_path()),
+        WeightsSource::File(_) => Err(Error::Msg(format!(
+            "{model_id} expects {dir_label} (tokenizer/ text_encoder/ transformer/ vae/) as \
+             `weights`, not a single .safetensors file"
+        ))),
+    }
+}
+
+/// Free-function form of "the control checkpoint is required", for use in a provider's `load(spec)`.
+///
+/// Returns the [`WeightsSource`] of [`LoadSpec::control`], or an [`Error::Msg`] that names `model_id`
+/// and `control_weights_label` (e.g. `"Fun-Controlnet-Union"`, `"FLUX.2-dev-Fun-Controlnet-Union"`,
+/// `"InstantX Qwen-Image-ControlNet-Union"`). The existing `load_rejects_missing_control_weights`
+/// smokes assert on the label substring this produces.
+pub fn require_control<'a>(
+    spec: &'a LoadSpec,
+    model_id: &str,
+    control_weights_label: &str,
+) -> Result<&'a WeightsSource> {
+    spec.control.as_ref().ok_or_else(|| {
+        Error::Msg(format!(
+            "{model_id} requires the {control_weights_label} weights — set LoadSpec::control \
+             (e.g. with_control(WeightsSource::File(...)))"
+        ))
+    })
+}
+
+/// **Require a named model component at load** (epic 13657) — the [`LoadSpec::components`] analogue of
+/// [`require_control`], for use at the top of a provider's `load(spec)`.
+///
+/// Returns the [`WeightsSource`] the caller staged under component `id` in
+/// [`LoadSpec::components`], or a caller-actionable [`Error::Msg`] that names `model_id`, the
+/// human-readable `label`, and the exact builder call to fix it. This is what converts a model's
+/// "fetch a missing sub-weight mid-render" habit (e.g. perth's watermark weights) into a **load-time**
+/// contract error: a provider declares the id in
+/// [`ModelDescriptor::required_components`](crate::generator::ModelDescriptor::required_components) and
+/// reads it here before doing any work, so an unprovisioned component fails fast at `load`, not at the
+/// first `generate`.
+///
+/// `label` is the model's own description of the component (e.g. `"Perth watermarker"`), woven into
+/// the message like `control_weights_label` is for [`require_control`].
+pub fn require_component<'a>(
+    spec: &'a LoadSpec,
+    id: &str,
+    model_id: &str,
+    label: &str,
+) -> Result<&'a WeightsSource> {
+    spec.components.get(id).ok_or_else(|| {
+        Error::Msg(format!(
+            "{model_id} requires the {label} component '{id}' — stage it in LoadSpec::components \
+             (e.g. with_component(\"{id}\", WeightsSource::File(...)))"
+        ))
+    })
+}
+
+/// **Reject unrecognized component keys** (epic 13657) — the [`LoadSpec::components`] guard that
+/// mirrors the hand-written per-slot `Error::Unsupported` guards a provider writes for the typed slots
+/// it does not support (e.g. chatterbox rejecting `control`/`ip_adapter`).
+///
+/// A provider calls this at the top of `load(spec)` with the set of component ids it actually reads —
+/// normally its
+/// [`ModelDescriptor::required_components`](crate::generator::ModelDescriptor::required_components).
+/// Any key present in [`LoadSpec::components`] but **not** in `known` is a caller mistake (a typo, or a
+/// component meant for a different model), returned as the typed [`Error::Unsupported`] so the worker /
+/// backend gating distinguishes it from a malformed request — the same convention the typed-slot
+/// guards use. The first unknown key (iteration is over the `BTreeMap`, so deterministically the
+/// lexicographically-smallest) is reported. An empty `components` map, or one whose every key is
+/// `known`, is `Ok(())`.
+pub fn reject_unknown_components(spec: &LoadSpec, known: &[&str], model_id: &str) -> Result<()> {
+    for key in spec.components.keys() {
+        if !known.contains(&key.as_str()) {
+            return Err(Error::Unsupported(format!(
+                "{model_id} does not recognize the component key '{key}' \
+                 (known components: {known:?}) — check LoadSpec::components for a typo or a \
+                 component staged for the wrong model"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::generator::{Capabilities, GenerationRequest, Generator, Modality, ModelDescriptor};
+    use crate::media::Image;
+    use std::path::PathBuf;
+
+    fn img() -> Image {
+        Image {
+            width: 4,
+            height: 4,
+            pixels: vec![0u8; 4 * 4 * 3],
+        }
+    }
+
+    fn req_with(conditioning: Vec<Conditioning>) -> GenerationRequest {
+        GenerationRequest {
+            conditioning,
+            ..Default::default()
+        }
+    }
+
+    /// A minimal control struct to exercise the default trait methods without weights/tensors.
+    struct Stub {
+        descriptor: ModelDescriptor,
+        accepted: AcceptedControlKinds,
+    }
+
+    impl Generator for Stub {
+        fn descriptor(&self) -> &ModelDescriptor {
+            &self.descriptor
+        }
+        fn validate(&self, _req: &GenerationRequest) -> Result<()> {
+            Ok(())
+        }
+        fn generate(
+            &self,
+            _req: &GenerationRequest,
+            _on_progress: &mut dyn FnMut(crate::Progress),
+        ) -> Result<crate::GenerationOutput> {
+            unreachable!("stub does not generate")
+        }
+    }
+
+    impl ControlBranch for Stub {
+        fn model_id(&self) -> &'static str {
+            "stub_control"
+        }
+        fn accepted_control_kinds(&self) -> AcceptedControlKinds {
+            self.accepted.clone()
+        }
+    }
+
+    fn stub(accepted: AcceptedControlKinds) -> Stub {
+        Stub {
+            descriptor: ModelDescriptor {
+                control_kinds: None,
+                required_components: &[],
+                id: "stub_control",
+                family: "stub",
+                backend: "mlx",
+                modality: Modality::Image,
+                capabilities: Capabilities::default(),
+            },
+            accepted,
+        }
+    }
+
+    #[test]
+    fn accepted_any_admits_everything() {
+        let any = AcceptedControlKinds::Any;
+        assert!(any.accepts(&ControlKind::Pose));
+        assert!(any.accepts(&ControlKind::Canny));
+        assert!(any.accepts(&ControlKind::Depth));
+        assert!(any.accepts(&ControlKind::Other("seg".into())));
+    }
+
+    #[test]
+    fn accepted_only_restricts() {
+        let pose = AcceptedControlKinds::Only(vec![ControlKind::Pose]);
+        assert!(pose.accepts(&ControlKind::Pose));
+        assert!(!pose.accepts(&ControlKind::Canny));
+        assert!(!pose.accepts(&ControlKind::Depth));
+    }
+
+    #[test]
+    fn require_base_dir_accepts_dir_rejects_file() {
+        let dir = LoadSpec::new(WeightsSource::Dir(PathBuf::from("/snap")));
+        assert_eq!(
+            require_base_dir(&dir, "m", "a base snapshot directory").unwrap(),
+            Path::new("/snap")
+        );
+        let file = LoadSpec::new(WeightsSource::File(PathBuf::from("/x.safetensors")));
+        let err = require_base_dir(&file, "m", "a base snapshot directory")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("snapshot directory"), "got: {err}");
+    }
+
+    #[test]
+    fn require_control_present_and_missing() {
+        let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from("/snap")))
+            .with_control(WeightsSource::File(PathBuf::from("/c.safetensors")));
+        require_control(&spec, "m", "Fun-Controlnet-Union").unwrap();
+
+        let bare = LoadSpec::new(WeightsSource::Dir(PathBuf::from("/snap")));
+        let err = require_control(&bare, "m", "Fun-Controlnet-Union")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Fun-Controlnet-Union"), "got: {err}");
+    }
+
+    /// Conformance check 2 (sc-13658): a required component MISSING from `LoadSpec::components` is a
+    /// **load-time** contract error, and the error is caller-actionable (names the model, the id, and
+    /// the `with_component` builder to call). A present component resolves to its staged source.
+    #[test]
+    fn require_component_present_and_missing() {
+        // Present → returns the staged source.
+        let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from("/snap"))).with_component(
+            "perth",
+            WeightsSource::File(PathBuf::from("/perth.safetensors")),
+        );
+        let src = require_component(&spec, "perth", "chatterbox_tts", "Perth watermarker").unwrap();
+        assert!(matches!(src, WeightsSource::File(p) if p == Path::new("/perth.safetensors")));
+
+        // Missing → a load-time Msg naming the model, the id, and the builder to fix it.
+        let bare = LoadSpec::new(WeightsSource::Dir(PathBuf::from("/snap")));
+        let err =
+            require_component(&bare, "perth", "chatterbox_tts", "Perth watermarker").unwrap_err();
+        assert!(
+            matches!(err, Error::Msg(_)),
+            "missing component is a request-shape error: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("chatterbox_tts"), "names the model: {msg}");
+        assert!(msg.contains("'perth'"), "names the id: {msg}");
+        assert!(msg.contains("with_component"), "names the builder: {msg}");
+    }
+
+    /// Conformance check 3 (sc-13658): a component key the model does not recognize is rejected as the
+    /// typed [`Error::Unsupported`] (mirroring the hand-written per-slot guards), while an empty map or
+    /// one whose every key is known passes.
+    #[test]
+    fn reject_unknown_components_rejects_unknown_key() {
+        let known = ["perth", "voice_embedding"];
+
+        // Empty map → Ok.
+        let empty = LoadSpec::new(WeightsSource::Dir(PathBuf::from("/snap")));
+        reject_unknown_components(&empty, &known, "chatterbox_tts").unwrap();
+
+        // All keys known → Ok.
+        let ok = empty
+            .clone()
+            .with_component("perth", WeightsSource::File(PathBuf::from("/p")))
+            .with_component("voice_embedding", WeightsSource::File(PathBuf::from("/v")));
+        reject_unknown_components(&ok, &known, "chatterbox_tts").unwrap();
+
+        // An unknown key → typed Unsupported naming the offending key.
+        let bad = ok
+            .clone()
+            .with_component("mystery", WeightsSource::File(PathBuf::from("/m")));
+        let err = reject_unknown_components(&bad, &known, "chatterbox_tts").unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "an unrecognized component key is a capability gap → Unsupported, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("mystery"),
+            "names the offending key: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_control_kind_dup_missing() {
+        let s = stub(AcceptedControlKinds::Only(vec![ControlKind::Pose]));
+
+        // present + admitted
+        let r = req_with(vec![Conditioning::Control {
+            image: img(),
+            kind: ControlKind::Pose,
+            scale: Some(0.7),
+        }]);
+        let (_, scale) = s.resolve_control(&r).unwrap();
+        assert_eq!(scale, 0.7);
+
+        // wrong kind rejected — a capability gap, so it must be typed `Unsupported` (F-002).
+        let r = req_with(vec![Conditioning::Control {
+            image: img(),
+            kind: ControlKind::Canny,
+            scale: Some(1.0),
+        }]);
+        let err = s.resolve_control(&r).unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "an unadmitted control kind is a capability gap → Unsupported, got {err:?}"
+        );
+
+        // duplicate rejected — a request-shape error, so it stays `Msg`.
+        let r = req_with(vec![
+            Conditioning::Control {
+                image: img(),
+                kind: ControlKind::Pose,
+                scale: Some(1.0),
+            },
+            Conditioning::Control {
+                image: img(),
+                kind: ControlKind::Pose,
+                scale: Some(1.0),
+            },
+        ]);
+        let err = s.resolve_control(&r).unwrap_err();
+        assert!(
+            matches!(&err, Error::Msg(_)) && err.to_string().contains("single control image"),
+            "got: {err:?}"
+        );
+
+        // missing rejected
+        let any = stub(AcceptedControlKinds::Any);
+        let r = req_with(vec![]);
+        let err = any.resolve_control(&r).unwrap_err().to_string();
+        assert!(err.contains("requires a Control"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_control_scale_default_and_explicit_inert() {
+        let any = stub(AcceptedControlKinds::Any);
+
+        // `None` → the per-model default (the trait default is full-strength 1.0).
+        let r = req_with(vec![Conditioning::Control {
+            image: img(),
+            kind: ControlKind::Pose,
+            scale: None,
+        }]);
+        let (_, scale) = any.resolve_control(&r).unwrap();
+        assert_eq!(scale, 1.0);
+
+        // `Some(0.0)` → an explicit inert branch, distinct from unset, used verbatim (F-085).
+        let r = req_with(vec![Conditioning::Control {
+            image: img(),
+            kind: ControlKind::Pose,
+            scale: Some(0.0),
+        }]);
+        let (_, scale) = any.resolve_control(&r).unwrap();
+        assert_eq!(scale, 0.0);
+    }
+
+    #[test]
+    fn require_control_present_checks_presence() {
+        let s = stub(AcceptedControlKinds::Any);
+        let r = req_with(vec![Conditioning::Control {
+            image: img(),
+            kind: ControlKind::Pose,
+            scale: Some(1.0),
+        }]);
+        s.require_control_present(&r).unwrap();
+
+        let r = req_with(vec![]);
+        let err = s.require_control_present(&r).unwrap_err().to_string();
+        assert!(err.contains("requires a Control"), "got: {err}");
+    }
+}

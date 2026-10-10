@@ -1,0 +1,45 @@
+[package]
+name = "mlx-gen-mage"
+version = "0.0.0"
+edition = "2021"
+description = "Mage-Flow (microsoft/Mage) provider crate for mlx-gen — 4B NR-MMDiT + Mage-VAE + Qwen3-VL text encoder."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "image", "mage-flow", "inference"]
+categories = ["science"]
+
+# PARALLEL-EXECUTION NOTE (sc-14037): every dependency the text-encoder (sc-14038), Mage-VAE
+# (sc-14039) and NR-MMDiT (sc-14040) ports need is declared here up front, so those three never
+# contend over this manifest. sc-14104 owned this file for the watermark RNG question — see the
+# RESOLVED note at the bottom; it added nothing.
+[dependencies]
+mlx-gen = { path = ".." }
+mlx-gen-boogu = { path = "../mlx-gen-boogu" }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+# `transformer/config.json` / `vae/config.json` / `scheduler/scheduler_config.json` parsing
+# (matches the sdxl/wan/ltx/flux2/lens provider convention: `serde_json::Value`, no derive).
+serde_json = { workspace = true }
+# PRODUCTION dependency, not dev-only: the Gaussian-Shading watermark (sc-14104) expands its
+# payload to a 256-bit message with SHA-256 (`_vendor/mage_flow/models/modules/mage_latent.py:59-60`)
+# and hashes non-numeric keys the same way (`:26`). Also used by the test suite as the byte tripwire
+# on the committed config fixtures.
+sha2 = { workspace = true }
+image = { workspace = true }
+
+# RESOLVED (sc-14104) — **no new dependency.** The scaffold left this open because bit-exact
+# watermark parity needs two RNG streams the reference mixes: `np.random.default_rng(key)`
+# (numpy `SeedSequence` → PCG64 XSL-RR → Lemire bounded ints) for the XOR pad and message-index map
+# (`mage_latent.py:68-74`), and a seeded `torch.Generator` (CPU MT19937 → `random64()` → 53-bit
+# uniform) for the per-entry uniforms (`:83-84`). No crate in this graph reproduces either stream,
+# and adopting one on its README would look like coverage while silently producing a different noise
+# tensor. Both algorithms are short and fully specified, and the parity golden is a bit-exact
+# oracle, so `src/latent.rs` implements them directly and pins them against draws captured from the
+# pinned numpy 2.4.3 / torch 2.13.0 environment — result: 0/32768 mismatches against `gs_noise` and
+# `gs_noise_bf16`. The dependency graph is unchanged.
+
+[dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }

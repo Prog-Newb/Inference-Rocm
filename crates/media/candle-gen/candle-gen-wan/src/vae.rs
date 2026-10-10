@@ -1,0 +1,1659 @@
+//! The **`AutoencoderKLWan`** (z48, `is_residual`) encoder/decoder — a port of diffusers
+//! `autoencoder_kl_wan.py`. Causal-Conv3d temporal VAE: latent `[B,48,T,H,W]` →
+//! `[B,3, 1+(T-1)·4, 16H, 16W]` in `[-1,1]`; the optional encoder supplies the inverse used by
+//! TI2V-5B Reference and keyframe conditioning.
+//!
+//! diffusers streams the decode frame-by-frame with a `feat_cache` (the causal temporal cache);
+//! that is mathematically identical to a single pass over all `T` frames with the causal
+//! left-padding ([`crate::conv3d`]) — except the temporal **upsampling**, where the first latent
+//! frame is passed through un-doubled and the rest are doubled via the `time_conv` channel
+//! interleave (the `first_chunk` rule). We reproduce that here in one pass.
+//!
+//! `WanRMS_norm` is a **channel-L2 normalization** over the channel axis (`x / max(‖x‖₂, 1e-12) ·
+//! √C · γ`), NOT GroupNorm; weights ship as `.gamma`.
+
+use candle_gen::candle_core::{DType, Result, Tensor};
+use candle_gen::candle_nn::ops::softmax_last_dim;
+use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::runtime::CancelFlag;
+use candle_gen::gen_core::tiling::{
+    TemporalOverlapPolicy, TileCandidates, TilingConfig, VaeTiling,
+};
+use candle_gen::vae_tiling;
+use candle_gen::{CandleError, Result as CResult};
+use std::sync::Mutex;
+
+use crate::config::{VaeConfig, LATENTS_MEAN, LATENTS_STD};
+use crate::conv3d::{chunked_conv2d, CausalConv3d, Ctx};
+
+const NORM_EPS: f64 = 1e-12;
+
+/// Run a streaming decode loop with cooperative cancellation and unconditional cache cleanup.
+/// Kept tensor-free so the cancellation/cleanup contract is unit-testable without a device.
+pub(crate) fn run_streaming_chunks<T>(
+    count: usize,
+    cancel: &CancelFlag,
+    mut decode_one: impl FnMut(usize) -> CResult<T>,
+    mut reset: impl FnMut(),
+) -> CResult<Vec<T>> {
+    reset();
+    let result = (|| {
+        let mut chunks = Vec::with_capacity(count);
+        for i in 0..count {
+            if cancel.is_cancelled() {
+                return Err(CandleError::Canceled);
+            }
+            chunks.push(decode_one(i)?);
+        }
+        Ok(chunks)
+    })();
+    reset();
+    result
+}
+
+/// Reset any stale streaming state, then reject a cancellation that was already set before decode.
+pub(crate) fn preflight_streaming_decode(
+    cancel: &CancelFlag,
+    mut reset: impl FnMut(),
+) -> CResult<()> {
+    reset();
+    if cancel.is_cancelled() {
+        Err(CandleError::Canceled)
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn candle_error(error: CandleError) -> candle_gen::candle_core::Error {
+    match error {
+        CandleError::Candle(error) => error,
+        CandleError::Msg(message) => candle_gen::candle_core::Error::Msg(message),
+        error @ CandleError::GeometryRefused { .. } => {
+            candle_gen::candle_core::Error::Msg(error.to_string())
+        }
+        // Compatibility wrappers use a fresh, never-cancelled flag, so this arm is defensive only.
+        CandleError::Canceled => candle_gen::candle_core::Error::Msg("cancelled".into()),
+    }
+}
+
+/// Channel-L2 norm (`F.normalize(dim=channel) · √C · γ`). Works on 4-D `[N,C,H,W]` and 5-D
+/// `[B,C,T,H,W]` tensors (channel axis 1). `pub(crate)` so the z16 [`crate::vae16`] sibling reuses it.
+pub(crate) struct ChanNorm {
+    gamma: Tensor, // [C]
+    sqrt_c: f64,
+}
+
+impl ChanNorm {
+    pub(crate) fn new(channels: usize, vb: VarBuilder) -> Result<Self> {
+        let gamma = vb.get_unchecked("gamma")?.flatten_all()?;
+        Ok(Self {
+            gamma,
+            sqrt_c: (channels as f64).sqrt(),
+        })
+    }
+
+    pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // Channel-L2 reduction in f32 for bf16 stability — a **no-op when `x` is already f32** (the two
+        // `to_dtype` calls collapse to bit-identical copies), so the z48 f32 decode is byte-for-byte
+        // unchanged. Under the A14B's bf16 z16 VAE (sc-12818) this L2 sum runs over up to 384 channels;
+        // bf16's 8-bit mantissa loses too much there, so reduce in f32 and apply the per-position norm
+        // scalar back in the working dtype — the UMT5 RMS-norm idiom (sc-12778). The activation itself
+        // stays bf16 for the VRAM win; only the reduction transits f32.
+        let dt = x.dtype();
+        let l2 = x
+            .to_dtype(DType::F32)?
+            .sqr()?
+            .sum_keepdim(1)?
+            .sqrt()?
+            .clamp(NORM_EPS, 1e30)?
+            .to_dtype(dt)?;
+        let normed = (x.broadcast_div(&l2)? * self.sqrt_c)?;
+        let c = self.gamma.dim(0)?;
+        let gshape = match x.rank() {
+            5 => vec![1, c, 1, 1, 1],
+            4 => vec![1, c, 1, 1],
+            _ => vec![1, c],
+        };
+        normed.broadcast_mul(&self.gamma.reshape(gshape)?)
+    }
+}
+
+/// A native 2-D conv applied per video frame (resample / attention 1×1 convs). `pub(crate)` for the
+/// z16 [`crate::vae16`] sibling.
+pub(crate) struct Conv2dW {
+    w: Tensor,
+    b: Tensor, // [1,O,1,1]
+    pad: usize,
+}
+
+impl Conv2dW {
+    pub(crate) fn load(
+        in_c: usize,
+        out_c: usize,
+        k: usize,
+        pad: usize,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        crate::quant::guard_dense(&vb)?;
+        Ok(Self {
+            w: vb.get((out_c, in_c, k, k), "weight")?.contiguous()?,
+            b: vb.get(out_c, "bias")?.reshape((1, out_c, 1, 1))?,
+            pad,
+        })
+    }
+    /// `x`: `[N, C, H, W]`. The conv2d is im2col-chunked ([`chunked_conv2d`]) so the hi-res VAE path —
+    /// e.g. the last z16 upsampler resample (192-ch 3×3 at 1280×720, ~1.59B-elem im2col) — cannot drive
+    /// candle's CUDA conv2d into its silent-corruption band; low-res stays a single un-chunked pass.
+    pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        chunked_conv2d(x, &self.w, self.pad, 1)?.broadcast_add(&self.b)
+    }
+}
+
+pub(crate) fn causal(
+    in_c: usize,
+    out_c: usize,
+    kernel: (usize, usize, usize),
+    vb: VarBuilder,
+) -> Result<CausalConv3d> {
+    CausalConv3d::load(in_c, out_c, kernel, vb)
+}
+
+pub(crate) struct Resnet {
+    norm1: ChanNorm,
+    conv1: CausalConv3d,
+    norm2: ChanNorm,
+    conv2: CausalConv3d,
+    shortcut: Option<CausalConv3d>,
+}
+
+impl Resnet {
+    pub(crate) fn new(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            norm1: ChanNorm::new(in_c, vb.pp("norm1"))?,
+            conv1: causal(in_c, out_c, (3, 3, 3), vb.pp("conv1"))?,
+            norm2: ChanNorm::new(out_c, vb.pp("norm2"))?,
+            conv2: causal(out_c, out_c, (3, 3, 3), vb.pp("conv2"))?,
+            shortcut: if in_c != out_c {
+                Some(causal(in_c, out_c, (1, 1, 1), vb.pp("conv_shortcut"))?)
+            } else {
+                None
+            },
+        })
+    }
+
+    pub(crate) fn forward(&self, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+        let h = match &self.shortcut {
+            Some(c) => c.forward(x, ctx)?,
+            None => x.clone(),
+        };
+        let y = self.conv1.forward(&self.norm1.forward(x)?.silu()?, ctx)?;
+        let y = self.conv2.forward(&self.norm2.forward(&y)?.silu()?, ctx)?;
+        y + h
+    }
+
+    pub(crate) fn reset_cache(&self) {
+        self.conv1.reset_cache();
+        self.conv2.reset_cache();
+        if let Some(c) = &self.shortcut {
+            c.reset_cache();
+        }
+    }
+}
+
+pub(crate) struct MidAttn {
+    norm: ChanNorm,
+    qkv: Conv2dW,
+    proj: Conv2dW,
+    channels: usize,
+}
+
+impl MidAttn {
+    pub(crate) fn new(channels: usize, vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            norm: ChanNorm::new(channels, vb.pp("norm"))?,
+            qkv: Conv2dW::load(channels, channels * 3, 1, 0, vb.pp("to_qkv"))?,
+            proj: Conv2dW::load(channels, channels, 1, 0, vb.pp("proj"))?,
+            channels,
+        })
+    }
+
+    /// `x`: `[B,C,T,H,W]`. Per-frame spatial self-attention.
+    pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let (b, c, t, h, w) = x.dims5()?;
+        let merged = x
+            .permute((0, 2, 1, 3, 4))?
+            .reshape((b * t, c, h, w))?
+            .contiguous()?;
+        let xn = self.norm.forward(&merged)?;
+        let qkv = self.qkv.forward(&xn)?; // [BT,3C,H,W]
+        let qkv = qkv
+            .reshape((b * t, 1, 3 * c, h * w))?
+            .permute((0, 1, 3, 2))?
+            .contiguous()?; // [BT,1,HW,3C]
+        let q = qkv.narrow(3, 0, c)?.contiguous()?;
+        let k = qkv.narrow(3, c, c)?.contiguous()?;
+        let v = qkv.narrow(3, 2 * c, c)?.contiguous()?;
+        let scale = (self.channels as f64).powf(-0.5);
+        let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
+        // Softmax reduction in f32 for bf16 stability (a no-op at f32 — bit-identical z48 path). The
+        // exp/sum over the H·W keys is the attention "variance" the story flags (sc-12818); the bf16
+        // QK/AV matmuls already accumulate in f32 on the tensor cores, so only the softmax needs the
+        // explicit upcast.
+        let attn = softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(scores.dtype())?;
+        let o = attn.matmul(&v)?; // [BT,1,HW,C]
+        let o = o
+            .squeeze(1)?
+            .permute((0, 2, 1))?
+            .reshape((b * t, c, h, w))?
+            .contiguous()?;
+        let o = self.proj.forward(&o)?;
+        let o = o
+            .reshape((b, t, c, h, w))?
+            .permute((0, 2, 1, 3, 4))?
+            .contiguous()?;
+        x + o
+    }
+}
+
+/// Parameter-free `DupUp3D` shortcut (channel-duplicate upsample). `first_chunk` drops the leading
+/// `factor_t-1` temporal frames to align with the causal main-path temporal expansion.
+struct Dup {
+    out_c: usize,
+    factor_t: usize,
+    factor_s: usize,
+    repeats: usize,
+}
+
+impl Dup {
+    fn new(in_c: usize, out_c: usize, factor_t: usize, factor_s: usize) -> Self {
+        let factor = factor_t * factor_s * factor_s;
+        Self {
+            out_c,
+            factor_t,
+            factor_s,
+            repeats: out_c * factor / in_c,
+        }
+    }
+
+    fn apply(&self, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+        let (b, c, t, h, w) = x.dims5()?;
+        // repeat_interleave channels: [B,C,T,H,W] → [B,C,repeats,T,H,W] → [B,C*repeats,T,H,W].
+        let x = x
+            .unsqueeze(2)?
+            .broadcast_as((b, c, self.repeats, t, h, w))?
+            .reshape((b, c * self.repeats, t, h, w))?;
+        let (ft, fs) = (self.factor_t, self.factor_s);
+        let x = x
+            .reshape(&[b, self.out_c, ft, fs, fs, t, h, w][..])?
+            .permute(&[0usize, 1, 5, 2, 6, 3, 7, 4][..])? // [B,out,t,ft,h,fs,w,fs]
+            .reshape((b, self.out_c, t * ft, h * fs, w * fs))?
+            .contiguous()?;
+        // Drop the leading ft-1 duplicated frames so the shortcut aligns with the causal main-path
+        // temporal expansion (the "first frame un-doubled" rule). Single pass: always (the clip's
+        // leading frames). Streaming: only on the first latent frame — later chunks keep all t·ft
+        // frames, matching the temporal upsampler which doubles them.
+        let drop_leading = ft > 1 && (!ctx.streaming || ctx.first_chunk);
+        if drop_leading {
+            let tt = x.dim(2)?;
+            x.narrow(2, ft - 1, tt - (ft - 1))
+        } else {
+            Ok(x)
+        }
+    }
+}
+
+pub(crate) enum Upsampler {
+    /// Temporal (3D): `time_conv` doubling + spatial 2× conv.
+    Temporal {
+        time_conv: CausalConv3d,
+        resample: Conv2dW,
+    },
+    /// Spatial-only (2D): nearest-2× + conv.
+    Spatial { resample: Conv2dW },
+}
+
+impl Upsampler {
+    /// Per-frame nearest-2× upsample then the 3×3 resample conv. `x`: `[B,C,T,H,W]`.
+    fn spatial(resample: &Conv2dW, x: &Tensor) -> Result<Tensor> {
+        let (b, c, t, h, w) = x.dims5()?;
+        let merged = x
+            .permute((0, 2, 1, 3, 4))?
+            .reshape((b * t, c, h, w))?
+            .contiguous()?;
+        let up = merged.upsample_nearest2d(h * 2, w * 2)?;
+        let y = resample.forward(&up)?;
+        let (_, oc, oh, ow) = y.dims4()?;
+        y.reshape((b, t, oc, oh, ow))?
+            .permute((0, 2, 1, 3, 4))?
+            .contiguous()
+    }
+
+    /// Double `t` frames → `2t` via the channel-interleave of `time_conv` (a `[B,2C,t,H,W]` output).
+    fn double_temporal(time_conv: &CausalConv3d, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+        let (b, c, t, h, w) = x.dims5()?;
+        let tc = time_conv.forward(x, ctx)?; // [B,2C,t,H,W]
+        tc.reshape((b, 2, c, t, h, w))?
+            .permute((0, 2, 3, 1, 4, 5))? // [B,C,t,2,H,W]
+            .reshape((b, c, 2 * t, h, w))?
+            .contiguous()
+    }
+
+    pub(crate) fn forward(&self, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+        match self {
+            Upsampler::Spatial { resample } => Self::spatial(resample, x),
+            Upsampler::Temporal {
+                time_conv,
+                resample,
+            } => {
+                let x_t = if ctx.streaming {
+                    // Per-frame: the first latent frame passes un-doubled (and never touches the
+                    // time_conv cache, matching the single-pass `first`); every later frame is
+                    // doubled through the streaming time_conv.
+                    if ctx.first_chunk {
+                        x.clone()
+                    } else {
+                        Self::double_temporal(time_conv, x, ctx)?
+                    }
+                } else {
+                    // Single pass: frame 0 un-doubled, frames 1.. doubled in one time_conv call.
+                    let t = x.dim(2)?;
+                    if t > 1 {
+                        let first = x.narrow(2, 0, 1)?;
+                        let rest = x.narrow(2, 1, t - 1)?;
+                        let doubled = Self::double_temporal(time_conv, &rest, ctx)?;
+                        Tensor::cat(&[&first, &doubled], 2)?
+                    } else {
+                        x.narrow(2, 0, 1)?
+                    }
+                };
+                Self::spatial(resample, &x_t)
+            }
+        }
+    }
+
+    pub(crate) fn reset_cache(&self) {
+        if let Upsampler::Temporal { time_conv, .. } = self {
+            time_conv.reset_cache();
+        }
+    }
+}
+
+struct UpBlock {
+    resnets: Vec<Resnet>,
+    upsampler: Option<Upsampler>,
+    dup: Option<Dup>,
+}
+
+/// Encoder spatial 2× downsample: asymmetric bottom/right pad followed by a stride-2 3×3 conv.
+struct SpatialDown {
+    w: Tensor,
+    b: Tensor,
+}
+
+impl SpatialDown {
+    fn load(channels: usize, vb: VarBuilder) -> Result<Self> {
+        crate::quant::guard_dense(&vb)?;
+        Ok(Self {
+            w: vb.get((channels, channels, 3, 3), "weight")?.contiguous()?,
+            b: vb.get(channels, "bias")?.reshape((1, channels, 1, 1))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let (b, c, t, h, w) = x.dims5()?;
+        let x = x
+            .permute((0, 2, 1, 3, 4))?
+            .reshape((b * t, c, h, w))?
+            .contiguous()?
+            .pad_with_zeros(2, 0, 1)?
+            .pad_with_zeros(3, 0, 1)?;
+        let y = chunked_conv2d(&x, &self.w, 0, 2)?.broadcast_add(&self.b)?;
+        let (_, oc, oh, ow) = y.dims4()?;
+        y.reshape((b, t, oc, oh, ow))?
+            .permute((0, 2, 1, 3, 4))?
+            .contiguous()
+    }
+}
+
+/// Encoder temporal stride-2 `(3,1,1)` conv. The first causal chunk passes through; every later
+/// chunk prepends the previous chunk's final frame, matching `WanResample(downsample3d)`.
+struct TemporalDown {
+    w: Tensor,
+    b: Tensor,
+    cache: Mutex<Option<Tensor>>,
+}
+
+impl TemporalDown {
+    fn load(channels: usize, vb: VarBuilder) -> Result<Self> {
+        crate::quant::guard_dense(&vb)?;
+        Ok(Self {
+            w: vb
+                .get((channels, channels, 3, 1, 1), "weight")?
+                .contiguous()?,
+            b: vb.get(channels, "bias")?.reshape((1, channels, 1, 1, 1))?,
+            cache: Mutex::new(None),
+        })
+    }
+
+    fn reset_cache(&self) {
+        *candle_gen::lock_recover(&self.cache) = None;
+    }
+
+    fn forward(&self, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+        let t = x.dim(2)?;
+        let last = x.narrow(2, t - 1, 1)?.contiguous()?;
+        if ctx.first_chunk {
+            *candle_gen::lock_recover(&self.cache) = Some(last);
+            return Ok(x.clone());
+        }
+        let prev = candle_gen::lock_recover(&self.cache)
+            .clone()
+            .ok_or_else(|| {
+                candle_gen::candle_core::Error::Msg(
+                    "Wan z48 temporal encoder cache was not warmed".into(),
+                )
+            })?;
+        let x = Tensor::cat(&[&prev, x], 2)?;
+        *candle_gen::lock_recover(&self.cache) = Some(last);
+        self.strided_conv(&x)
+    }
+
+    fn strided_conv(&self, x: &Tensor) -> Result<Tensor> {
+        let (b, c, tc, h, w) = x.dims5()?;
+        let out_t = (tc - 3) / 2 + 1;
+        let mut acc: Option<Tensor> = None;
+        for k in 0..3 {
+            let indices = (0..out_t).map(|o| (2 * o + k) as u32).collect::<Vec<_>>();
+            let indices = Tensor::from_vec(indices, out_t, x.device())?;
+            let frames = x.index_select(&indices, 2)?;
+            let frames = frames
+                .permute((0, 2, 1, 3, 4))?
+                .reshape((b * out_t, c, h, w))?
+                .contiguous()?;
+            let wk = self.w.narrow(2, k, 1)?.squeeze(2)?.contiguous()?;
+            let y = chunked_conv2d(&frames, &wk, 0, 1)?;
+            acc = Some(match acc {
+                Some(sum) => (sum + y)?,
+                None => y,
+            });
+        }
+        let y = acc.expect("kernel has three taps");
+        let (_, oc, oh, ow) = y.dims4()?;
+        y.reshape((b, out_t, oc, oh, ow))?
+            .permute((0, 2, 1, 3, 4))?
+            .contiguous()?
+            .broadcast_add(&self.b)
+    }
+}
+
+/// Parameter-free residual down shortcut (`AvgDown3D`) used by the Wan2.2 z48 encoder.
+struct AvgDown {
+    out_c: usize,
+    factor_t: usize,
+    factor_s: usize,
+    factor: usize,
+    group_size: usize,
+}
+
+impl AvgDown {
+    fn new(in_c: usize, out_c: usize, factor_t: usize, factor_s: usize) -> Self {
+        let factor = factor_t * factor_s * factor_s;
+        Self {
+            out_c,
+            factor_t,
+            factor_s,
+            factor,
+            group_size: in_c * factor / out_c,
+        }
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let (b, c, mut t, h, w) = x.dims5()?;
+        let pad_t = (self.factor_t - t % self.factor_t) % self.factor_t;
+        let x = if pad_t > 0 {
+            t += pad_t;
+            x.pad_with_zeros(2, pad_t, 0)?
+        } else {
+            x.clone()
+        };
+        x.reshape(
+            &[
+                b,
+                c,
+                t / self.factor_t,
+                self.factor_t,
+                h / self.factor_s,
+                self.factor_s,
+                w / self.factor_s,
+                self.factor_s,
+            ][..],
+        )?
+        .permute(&[0usize, 1, 3, 5, 7, 2, 4, 6][..])?
+        .reshape((
+            b,
+            c * self.factor,
+            t / self.factor_t,
+            h / self.factor_s,
+            w / self.factor_s,
+        ))?
+        .reshape((
+            b,
+            self.out_c,
+            self.group_size,
+            t / self.factor_t,
+            h / self.factor_s,
+            w / self.factor_s,
+        ))?
+        .mean(2)
+    }
+}
+
+/// One grouped residual encoder stage (`WanResidualDownBlock`).
+struct DownBlock {
+    shortcut: AvgDown,
+    resnets: Vec<Resnet>,
+    spatial: Option<SpatialDown>,
+    temporal: Option<TemporalDown>,
+}
+
+impl DownBlock {
+    fn forward(&self, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+        let shortcut = self.shortcut.forward(x)?;
+        let mut h = x.clone();
+        for resnet in &self.resnets {
+            h = resnet.forward(&h, ctx)?;
+        }
+        if let Some(spatial) = &self.spatial {
+            h = spatial.forward(&h)?;
+        }
+        if let Some(temporal) = &self.temporal {
+            h = temporal.forward(&h, ctx)?;
+        }
+        h + shortcut
+    }
+
+    fn reset_cache(&self) {
+        for resnet in &self.resnets {
+            resnet.reset_cache();
+        }
+        if let Some(temporal) = &self.temporal {
+            temporal.reset_cache();
+        }
+    }
+}
+
+/// Full Wan2.2 z48 encoder. RGB is 2×2 patchified to 12 channels before the 160-wide stack.
+struct Encoder {
+    conv_in: CausalConv3d,
+    down_blocks: Vec<DownBlock>,
+    mid_resnet0: Resnet,
+    mid_attn: MidAttn,
+    mid_resnet1: Resnet,
+    norm_out: ChanNorm,
+    conv_out: CausalConv3d,
+}
+
+/// Spatial 2x2 patchify used by the z48 encoder. Keeping this as a tensor-only seam makes the
+/// checkpoint's channel order testable without constructing the production-width encoder.
+fn patchify_encoder_input(video: &Tensor, patch_size: usize) -> Result<Tensor> {
+    if patch_size == 1 {
+        return Ok(video.clone());
+    }
+    let (b, c, t, h, w) = video.dims5()?;
+    video
+        .reshape(
+            &[
+                b,
+                c,
+                t,
+                h / patch_size,
+                patch_size,
+                w / patch_size,
+                patch_size,
+            ][..],
+        )?
+        // MLX order is channels, width-offset (`r`), height-offset (`q`).
+        .permute(&[0usize, 1, 6, 4, 2, 3, 5][..])?
+        .reshape((
+            b,
+            c * patch_size * patch_size,
+            t,
+            h / patch_size,
+            w / patch_size,
+        ))?
+        .contiguous()
+}
+
+impl Encoder {
+    fn new(cfg: &VaeConfig, vb: VarBuilder) -> Result<Self> {
+        const ENCODER_BASE: usize = 160;
+        let dims = [ENCODER_BASE, ENCODER_BASE, 320, 640, 640];
+        let temporal = [false, true, true, false];
+        let conv_in = causal(12, dims[0], (3, 3, 3), vb.pp("conv_in"))?;
+        let mut down_blocks = Vec::with_capacity(4);
+        for i in 0..4 {
+            let db = vb.pp("down_blocks").pp(i);
+            let mut resnets = Vec::with_capacity(cfg.num_res_blocks);
+            let mut in_c = dims[i];
+            for j in 0..cfg.num_res_blocks {
+                resnets.push(Resnet::new(in_c, dims[i + 1], db.pp("resnets").pp(j))?);
+                in_c = dims[i + 1];
+            }
+            let down = i != 3;
+            down_blocks.push(DownBlock {
+                shortcut: AvgDown::new(
+                    dims[i],
+                    dims[i + 1],
+                    if temporal[i] { 2 } else { 1 },
+                    if down { 2 } else { 1 },
+                ),
+                resnets,
+                spatial: if down {
+                    Some(SpatialDown::load(
+                        dims[i + 1],
+                        db.pp("downsampler").pp("resample").pp("1"),
+                    )?)
+                } else {
+                    None
+                },
+                temporal: if down && temporal[i] {
+                    Some(TemporalDown::load(
+                        dims[i + 1],
+                        db.pp("downsampler").pp("time_conv"),
+                    )?)
+                } else {
+                    None
+                },
+            });
+        }
+        let mid = vb.pp("mid_block");
+        Ok(Self {
+            conv_in,
+            down_blocks,
+            mid_resnet0: Resnet::new(640, 640, mid.pp("resnets").pp("0"))?,
+            mid_attn: MidAttn::new(640, mid.pp("attentions").pp("0"))?,
+            mid_resnet1: Resnet::new(640, 640, mid.pp("resnets").pp("1"))?,
+            norm_out: ChanNorm::new(640, vb.pp("norm_out"))?,
+            conv_out: causal(640, 2 * cfg.z_dim, (3, 3, 3), vb.pp("conv_out"))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+        let mut h = self.conv_in.forward(x, ctx)?;
+        for block in &self.down_blocks {
+            h = block.forward(&h, ctx)?;
+        }
+        h = self.mid_resnet0.forward(&h, ctx)?;
+        h = self.mid_attn.forward(&h)?;
+        h = self.mid_resnet1.forward(&h, ctx)?;
+        self.conv_out
+            .forward(&self.norm_out.forward(&h)?.silu()?, ctx)
+    }
+
+    fn reset_cache(&self) {
+        self.conv_in.reset_cache();
+        for block in &self.down_blocks {
+            block.reset_cache();
+        }
+        self.mid_resnet0.reset_cache();
+        self.mid_resnet1.reset_cache();
+        self.conv_out.reset_cache();
+    }
+}
+
+impl UpBlock {
+    fn forward(&self, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+        let x_copy = x.clone();
+        let mut h = x.clone();
+        for r in &self.resnets {
+            h = r.forward(&h, ctx)?;
+        }
+        if let Some(up) = &self.upsampler {
+            h = up.forward(&h, ctx)?;
+        }
+        if let Some(dup) = &self.dup {
+            h = (h + dup.apply(&x_copy, ctx)?)?;
+        }
+        Ok(h)
+    }
+
+    fn reset_cache(&self) {
+        for r in &self.resnets {
+            r.reset_cache();
+        }
+        if let Some(up) = &self.upsampler {
+            up.reset_cache();
+        }
+    }
+}
+
+pub struct WanVae {
+    mean: Tensor, // [1,48,1,1,1]
+    std: Tensor,
+    post_quant_conv: CausalConv3d,
+    conv_in: CausalConv3d,
+    mid_resnet0: Resnet,
+    mid_attn: MidAttn,
+    mid_resnet1: Resnet,
+    up_blocks: Vec<UpBlock>,
+    norm_out: ChanNorm,
+    conv_out: CausalConv3d,
+    patch_size: usize,
+    out_channels: usize,
+    encoder: Option<(Encoder, CausalConv3d)>,
+    z_dim: usize,
+}
+
+impl WanVae {
+    /// Geometry owned by the concrete causal z48 decoder.
+    pub const VAE_TILING: VaeTiling = VaeTiling::WAN22;
+
+    pub fn new(cfg: &VaeConfig, vb: VarBuilder) -> Result<Self> {
+        Self::new_inner(cfg, vb, false)
+    }
+
+    /// Build the z48 VAE with its real causal encoder for Reference/keyframe TI2V conditioning.
+    pub fn new_with_encoder(cfg: &VaeConfig, vb: VarBuilder) -> Result<Self> {
+        Self::new_inner(cfg, vb, true)
+    }
+
+    fn new_inner(cfg: &VaeConfig, vb: VarBuilder, with_encoder: bool) -> Result<Self> {
+        let device = vb.device();
+        let mean = Tensor::from_vec(LATENTS_MEAN.to_vec(), (1, 48, 1, 1, 1), device)?;
+        let std = Tensor::from_vec(LATENTS_STD.to_vec(), (1, 48, 1, 1, 1), device)?;
+        let post_quant_conv = causal(cfg.z_dim, cfg.z_dim, (1, 1, 1), vb.pp("post_quant_conv"))?;
+
+        let dec = vb.pp("decoder");
+        // dims = [base*4] + base*[reversed dim_mult] = [1024, 1024,1024,512,256] for base=256.
+        let b = cfg.base_dim;
+        let dims = [b * 4, b * 4, b * 4, b * 2, b];
+        let conv_in = causal(cfg.z_dim, dims[0], (3, 3, 3), dec.pp("conv_in"))?;
+
+        let mid = dec.pp("mid_block");
+        let mid_resnet0 = Resnet::new(dims[0], dims[0], mid.pp("resnets").pp("0"))?;
+        let mid_attn = MidAttn::new(dims[0], mid.pp("attentions").pp("0"))?;
+        let mid_resnet1 = Resnet::new(dims[0], dims[0], mid.pp("resnets").pp("1"))?;
+
+        // temperal_upsample = [true, true, false]; up_flag = i != 3.
+        let temporal = [true, true, false, false];
+        let mut up_blocks = Vec::with_capacity(4);
+        for i in 0..4 {
+            let (in_c, out_c) = (dims[i], dims[i + 1]);
+            let up_flag = i != 3;
+            let ub = dec.pp("up_blocks").pp(i);
+            let mut resnets = Vec::with_capacity(cfg.num_res_blocks + 1);
+            let mut cur = in_c;
+            for j in 0..(cfg.num_res_blocks + 1) {
+                resnets.push(Resnet::new(cur, out_c, ub.pp("resnets").pp(j))?);
+                cur = out_c;
+            }
+            let (upsampler, dup) = if up_flag {
+                let up = if temporal[i] {
+                    Upsampler::Temporal {
+                        time_conv: causal(
+                            out_c,
+                            out_c * 2,
+                            (3, 1, 1),
+                            ub.pp("upsampler").pp("time_conv"),
+                        )?,
+                        resample: Conv2dW::load(
+                            out_c,
+                            out_c,
+                            3,
+                            1,
+                            ub.pp("upsampler").pp("resample").pp("1"),
+                        )?,
+                    }
+                } else {
+                    Upsampler::Spatial {
+                        resample: Conv2dW::load(
+                            out_c,
+                            out_c,
+                            3,
+                            1,
+                            ub.pp("upsampler").pp("resample").pp("1"),
+                        )?,
+                    }
+                };
+                let factor_t = if temporal[i] { 2 } else { 1 };
+                (Some(up), Some(Dup::new(in_c, out_c, factor_t, 2)))
+            } else {
+                (None, None)
+            };
+            up_blocks.push(UpBlock {
+                resnets,
+                upsampler,
+                dup,
+            });
+        }
+
+        let norm_out = ChanNorm::new(dims[4], dec.pp("norm_out"))?;
+        let conv_out = causal(
+            dims[4],
+            cfg.conv_out_channels,
+            (3, 3, 3),
+            dec.pp("conv_out"),
+        )?;
+        let encoder = if with_encoder {
+            Some((
+                Encoder::new(cfg, vb.pp("encoder"))?,
+                causal(2 * cfg.z_dim, 2 * cfg.z_dim, (1, 1, 1), vb.pp("quant_conv"))?,
+            ))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            mean,
+            std,
+            post_quant_conv,
+            conv_in,
+            mid_resnet0,
+            mid_attn,
+            mid_resnet1,
+            up_blocks,
+            norm_out,
+            conv_out,
+            patch_size: cfg.patch_size,
+            out_channels: cfg.out_channels,
+            encoder,
+            z_dim: cfg.z_dim,
+        })
+    }
+
+    /// Encode `[B,3,T,H,W]` pixels in `[-1,1]`, with `T = 1 + 4·k`, to normalized z48 latents.
+    pub fn encode(&self, video: &Tensor) -> Result<Tensor> {
+        let (encoder, quant_conv) = self.encoder.as_ref().ok_or_else(|| {
+            candle_gen::candle_core::Error::Msg(
+                "WanVae: encode needs encoder weights (use new_with_encoder)".into(),
+            )
+        })?;
+        let (_b, c, t, h, w) = video.dims5()?;
+        if c != self.out_channels || t == 0 || !(t - 1).is_multiple_of(4) {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "WanVae::encode expects [B,{},1+4·k,H,W] (got channels={c}, frames={t})",
+                self.out_channels
+            )));
+        }
+        let p = self.patch_size;
+        if !h.is_multiple_of(p) || !w.is_multiple_of(p) {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "WanVae::encode image size must be divisible by patch size {p} (got {w}x{h})"
+            )));
+        }
+        let video = patchify_encoder_input(&video.to_dtype(DType::F32)?, p)?;
+
+        encoder.reset_cache();
+        let result = (|| {
+            let mut chunks = Vec::with_capacity(1 + (t - 1) / 4);
+            for i in 0..(1 + (t - 1) / 4) {
+                let (start, len) = if i == 0 { (0, 1) } else { (1 + 4 * (i - 1), 4) };
+                let chunk = video.narrow(2, start, len)?.contiguous()?;
+                chunks.push(encoder.forward(&chunk, &Ctx::streaming(i == 0))?);
+            }
+            let moments = Tensor::cat(&chunks.iter().collect::<Vec<_>>(), 2)?;
+            let moments = quant_conv.forward(&moments, &Ctx::single_pass())?;
+            moments
+                .narrow(1, 0, self.z_dim)?
+                .to_dtype(DType::F32)?
+                .broadcast_sub(&self.mean)?
+                .broadcast_div(&self.std)
+        })();
+        encoder.reset_cache();
+        quant_conv.reset_cache();
+        result
+    }
+
+    /// Decode latents `[B,48,T,H,W]` → RGB frames `[B,3, 1+(T-1)·4, 16H, 16W]` in `[-1,1]`.
+    ///
+    /// **Streams one latent frame at a time** (sc-5176): the original single pass decoded every frame
+    /// at once, spiking VAE memory ~60 GB on a 320²×17 clip (OOM). Each `CausalConv3d` carries its
+    /// causal `feat_cache` across frames while bounding peak memory to ~one frame's activations.
+    /// Frame 0 expands to 1 output frame, each later
+    /// latent frame to 4 (the two temporal upsamplers) — total `1+(T-1)·4`.
+    pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
+        self.decode_with_cancel(z, &CancelFlag::default())
+            .map_err(candle_error)
+    }
+
+    /// Cancellable streaming decode. The flag is checked before every latent-frame decoder pass.
+    pub fn decode_with_cancel(&self, z: &Tensor, cancel: &CancelFlag) -> CResult<Tensor> {
+        preflight_streaming_decode(cancel, || self.reset_caches())?;
+        let z = self.unnormalize(z)?;
+        let t_lat = z.dim(2)?;
+        // Collect the per-frame decoded chunks and `cat` once (sc-9037): cat-ing onto a growing
+        // accumulator each iteration re-copies every prior frame → O(T²) copy traffic and briefly
+        // holds old+new. A single `Tensor::cat` at the end is O(T) and equivalent (same frames, same
+        // order along the temporal axis).
+        let chunks = run_streaming_chunks(
+            t_lat,
+            cancel,
+            |i| {
+                let zi = z.narrow(2, i, 1)?.contiguous()?;
+                Ok(self.decode_inner(&zi, &Ctx::streaming(i == 0))?)
+            },
+            || self.reset_caches(),
+        )?;
+        assert!(!chunks.is_empty(), "decode needs >= 1 latent frame");
+        Ok(Tensor::cat(&chunks, 2)?.clamp(-1f32, 1f32)?)
+    }
+
+    /// Decode with **spatial tiling** for memory-bounded high-resolution video (`cfg`) — the candle
+    /// half of sc-7111 (follow-on to the LTX budgeted decode, sc-7076/sc-6894).
+    ///
+    /// Unlike mlx-gen-wan's *single-pass* z48 decode (which needed full spatial **+ temporal** budgeted
+    /// tiling, sc-6894), candle-gen-wan's [`decode`](Self::decode) already **streams one latent frame at
+    /// a time** — so the temporal axis is already memory-bounded (peak ≈ one frame's decode, not the
+    /// whole clip). The only remaining spike is a single **high-resolution frame** decoded through the
+    /// z48 vae22 decoder; spatial tiling caps that. So this tiles **only the spatial axes** and keeps
+    /// the streaming temporal bound: each spatial tile is itself decoded via the per-frame streaming
+    /// `decode`, preserving the causal feat-cache semantics.
+    ///
+    /// Shares the pure [`gen_core::tiling`](candle_gen::gen_core::tiling) geometry verbatim with the LTX
+    /// half ([`VaeTiling::WAN22`]: ×16 spatial, ×4 **causal** temporal): splits the latent into
+    /// overlapping spatial tiles, decodes each through the streaming `decode`, and trapezoidally
+    /// blends them into the full video by pad-and-accumulate (bounded peak = one tile's streaming decode
+    /// plus the full-output `output`/`weights` buffers). Falls back to single-pass `decode` when `cfg`
+    /// does not fire for these dims. `cfg` is expected to carry **spatial** tiling only (the budgeted
+    /// selector never tiles the temporal axis here); a temporal `cfg` would split the causal stream at
+    /// tile boundaries and is not bit-exact vs. the streaming `decode`.
+    pub fn decode_tiled(&self, z: &Tensor, cfg: &TilingConfig) -> Result<Tensor> {
+        self.decode_tiled_with_cancel(z, cfg, &CancelFlag::default())
+            .map_err(candle_error)
+    }
+
+    pub fn decode_tiled_with_cancel(
+        &self,
+        z: &Tensor,
+        cfg: &TilingConfig,
+        cancel: &CancelFlag,
+    ) -> CResult<Tensor> {
+        // The tile/narrow/blend/pad-accumulate/normalize DRIVER is shared with the LTX half in
+        // `candle_gen::vae_tiling::decode_tiled` (sc-9006 / F-026). What stays wan-specific: the
+        // `VaeTiling::WAN22` geometry and the per-frame-streaming `decode` closure. With a
+        // spatial-only `cfg`, `plan.t` is a single full-extent temporal tile, so the temporal loop
+        // runs once and each `decode` call streams the whole clip.
+        vae_tiling::decode_tiled(Self::VAE_TILING, "wan z48 vae22", z, cfg, |tile| {
+            self.decode_with_cancel(tile, cancel)
+        })
+    }
+
+    /// **Memory-bounded** decode (sc-7111): derive the decoded output dims from the latent geometry
+    /// (z48 vae22: ×16 spatial, ×4 **causal** temporal ⇒ `out_f = 1 + (T_lat−1)·4`), pick a budgeted
+    /// **spatial** tiling via [`auto_tiling_budgeted_wan22`], and run [`decode_tiled`](Self::decode_tiled)
+    /// — or the streaming [`decode`](Self::decode) when a single high-res frame already fits the VRAM
+    /// budget. An over-budget decode returns a **catchable** error here instead of OOM-ing the worker.
+    /// The candle z48 analogue of the LTX [`decode_budgeted`](crate::vae) wiring (sc-7076).
+    pub fn decode_budgeted(&self, z: &Tensor) -> Result<Tensor> {
+        self.decode_budgeted_with_cancel(z, &CancelFlag::default())
+            .map_err(candle_error)
+    }
+
+    pub fn decode_budgeted_with_cancel(&self, z: &Tensor, cancel: &CancelFlag) -> CResult<Tensor> {
+        self.decode_budgeted_with_cancel_and_tile_cap(z, cancel, None)
+    }
+
+    /// Budgeted decode with an optional provider-admitted maximum spatial tile edge. The selected
+    /// cap is intersected with the same live free-VRAM budget as the automatic path; it never raises
+    /// the live planner's tile size or substitutes a fixed budget. A selected cap also forces an
+    /// actual tiled plan at Wan's supported render envelope.
+    pub fn decode_budgeted_with_cancel_and_tile_cap(
+        &self,
+        z: &Tensor,
+        cancel: &CancelFlag,
+        max_tile_edge: Option<u32>,
+    ) -> CResult<Tensor> {
+        let (_b, _c, f, h, w) = z.dims5()?;
+        let out_f = 1 + (f as i32 - 1) * Self::VAE_TILING.temporal_scale; // causal ×4
+        let out_h = h as i32 * Self::VAE_TILING.spatial_scale; // ×16
+        let out_w = w as i32 * Self::VAE_TILING.spatial_scale;
+        let plan = match max_tile_edge {
+            Some(cap) => auto_tiling_budgeted_wan22_capped(out_h, out_w, out_f, cap)?,
+            None => auto_tiling_budgeted_wan22(out_h, out_w, out_f)?,
+        };
+        match plan {
+            Some(cfg) => self.decode_tiled_with_cancel(z, &cfg, cancel),
+            None => self.decode_with_cancel(z, cancel),
+        }
+    }
+
+    /// `z_pixel = z·std + mean` in f32 (the inverse of the encoder's per-channel normalize).
+    fn unnormalize(&self, z: &Tensor) -> Result<Tensor> {
+        z.to_dtype(DType::F32)?
+            .broadcast_mul(&self.std)?
+            .broadcast_add(&self.mean)
+    }
+
+    /// The decoder graph for one chunk (`ctx.streaming` selects the per-frame `feat_cache` path).
+    fn decode_inner(&self, z: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+        let mut h = self.post_quant_conv.forward(z, ctx)?;
+        h = self.conv_in.forward(&h, ctx)?;
+        h = self.mid_resnet0.forward(&h, ctx)?;
+        h = self.mid_attn.forward(&h)?;
+        h = self.mid_resnet1.forward(&h, ctx)?;
+        for ub in &self.up_blocks {
+            h = ub.forward(&h, ctx)?;
+        }
+        let h = self.norm_out.forward(&h)?.silu()?;
+        let h = self.conv_out.forward(&h, ctx)?; // [B,12,T',H8,W8]
+        self.unpatchify(&h)
+    }
+
+    /// Drop every streaming `feat_cache` (called around the [`Self::decode`] frame loop).
+    fn reset_caches(&self) {
+        self.post_quant_conv.reset_cache();
+        self.conv_in.reset_cache();
+        self.mid_resnet0.reset_cache();
+        self.mid_resnet1.reset_cache();
+        for ub in &self.up_blocks {
+            ub.reset_cache();
+        }
+        self.conv_out.reset_cache();
+    }
+
+    /// 12 → 3 channels, 2× spatial (inverse of the encoder's 2×2 patchify).
+    fn unpatchify(&self, x: &Tensor) -> Result<Tensor> {
+        let p = self.patch_size;
+        let (b, _cp, t, h, w) = x.dims5()?;
+        let c = self.out_channels;
+        x.reshape(&[b, c, p, p, t, h, w][..])?
+            .permute(&[0usize, 1, 4, 5, 3, 6, 2][..])? // [B,c,T,H,p,W,p]
+            .reshape((b, c, t, h * p, w * p))?
+            .contiguous()
+    }
+}
+
+// --- sc-7111 / sc-6894: budgeted z48 vae22 spatial-tiling for the candle decode -------------------
+//
+// Mirrors the candle LTX half (sc-7076, `candle-gen-ltx::vae`): the shared budgeted-tiling DRIVER +
+// budget resolver + selector now live ONCE in `candle_gen::vae_tiling` (sc-9006 / F-026, de-duped from
+// the byte-near-identical wan/ltx copies); this module supplies only the wan-specific cost CONSTANTS,
+// the spatial-only candidate grid, and the streaming cost model. The tile geometry itself is pure
+// gen-core (`gen_core::tiling`), byte-identical to the mlx side.
+//
+// **Structural difference from mlx-gen-wan** (why this is a spatial-only mirror, not a 1:1 port): the
+// candle `decode` STREAMS one latent frame at a time (`WanVae::decode`), so the temporal axis is
+// already memory-bounded — peak ≈ one frame's decode, not the whole clip. mlx-gen-wan's single-pass
+// decode needed full spatial+temporal budgeted tiling (sc-6894); candle only needs to cap the spike of
+// a single **high-resolution frame**, so the candidate grid below carries **no temporal candidates**
+// and the cost model's per-tile term is per-output-**pixel** (one streamed frame's activations), not
+// per-output-voxel (the whole tile) as in the mlx vae22 model.
+
+const GIB_F64: f64 = 1024.0 * 1024.0 * 1024.0;
+/// Env override read by the shared [`vae_tiling::free_aware_safe_budget_gib`] resolver.
+const WAN22_VAE_BUDGET_ENV: &str = "WAN_VAE_BUDGET_GIB";
+/// Fraction of **FREE** VRAM treated as safe (sc-12734). The decode runs *after* the denoise, so the
+/// fraction is applied to what the denoise LEFT free (`total − resident`), not `0.85×TOTAL` — see
+/// [`wan22_vae_safe_budget_gib`]. The 0.85 headroom itself matches the ltx / seedvr2 convention.
+const WAN22_VAE_BUDGET_SAFE_FRAC: f64 = 0.85;
+/// Fallback budget when neither the env override nor `nvidia-smi` yields a value.
+const WAN22_VAE_DEFAULT_BUDGET_GIB: f64 = 16.0;
+
+// Cost-model constants. **CUDA-CALIBRATED (sc-7148)** — fit from real-weight peak-VRAM anchors measured
+// by `tests/vae_decode_sweep.rs` on an RTX PRO 6000 Blackwell (sm_120, CUDA 12.9, f32, device-level
+// `nvidia-smi` peak) over real Wan2.2-TI2V-5B z48 weights. The five anchors (output WxHxF / largest
+// spatial tile → measured peak):
+//   768²×13  single-pass (full 768² frame)  → 29.17 GiB
+//   1280²×13 single-pass (full 1280² frame) → 76.46 GiB   (the high-res single-frame spike)
+//   1280²×13 tiled 256px                    →  6.30 GiB   (accumulator-dominated)
+//   1280²×13 tiled 512px                    → 22.87 GiB
+//   1280²×61 tiled 256px                    → 17.21 GiB   (accum ≈149 B/voxel from the out_vox slope)
+// Because `decode` STREAMS one latent frame at a time, the per-tile activation spike scales with ONE
+// output frame's area (`tile_h·tile_w`), not the whole tile's volume — so the model is `ACCUM·out_vox +
+// FRAME·frame_px`. The accumulator term (≈149 B/voxel, far above the mlx z48's 40 — candle's tiled
+// decode juggles more full-output buffers: the streaming per-tile `cat` plus the pad-and-accumulate
+// blend) and the per-frame term (≈50 000 B/px for a full frame, rising to ≈90 000 B/px for the smaller
+// tiles whose per-px decoder overhead amortizes worse) are rounded to the **conservative**
+// (over-predicting) side; the model reproduces every anchor at ratio 1.12–1.88× (never under).
+// sc-12474 removed the pad-to-full tile transients. We intentionally retain these pre-change
+// constants as conservative upper bounds: slice accumulation cannot raise the measured peak, and the
+// anchor regression below still proves that the selector does not under-predict any calibrated row.
+//
+// **The old placeholders (40 / 12 000) badly UNDER-predicted** — they forecast ~18 GiB for the 1280²
+// single-frame spike that really peaks 76 GiB, so the selector could have OK'd a single-pass / large
+// tile that OOMs. (The story's "even the conservative placeholder never OOMs" assumed the seed
+// over-estimated; the CUDA measurement shows it under-estimated by ~4×.) Re-run the sweep after a
+// decoder or candle-allocator change. See the `wan22_decode_peak_matches_cuda_anchors` test below.
+const WAN22_VAE_ACCUM_BYTES_PER_VOXEL: u64 = 160;
+const WAN22_VAE_FRAME_BYTES_PER_OUT_PX: u64 = 92_000;
+
+/// Candidate spatial tile sizes (output px, multiples of the vae22 ×16 scale, overlap 64). Matches the
+/// mlx `VAE22_SPATIAL_PX` grid.
+const WAN22_VAE_SPATIAL_PX: [i32; 8] = [768, 640, 512, 448, 384, 320, 256, 192];
+/// **No temporal candidates** — the candle decode is already temporally streaming-bounded, so the
+/// budgeted selector only ever tiles the spatial axes (see the module note above).
+const WAN22_VAE_TEMPORAL_FR: [(i32, i32); 0] = [];
+
+/// Estimated concurrent VRAM peak (GiB) of the streaming z48 vae22 decode while assembling an `out_*`
+/// video, the largest spatial tile spanning `tile_h·tile_w` output px. `ACCUM·out_voxels` is the
+/// unavoidable full-output accumulator floor; `FRAME·tile_h·tile_w` is one streamed frame's decoder
+/// activations (independent of `out_f`/`tile_f` — the temporal axis streams). Single-pass is
+/// `tile_* == out_*`; a zero tile yields the accumulator-only floor (the gen-core `budgeted_plan`
+/// contract). `tile_f` is unused: the temporal axis is never tiled here.
+fn estimated_wan22_decode_peak_gib(
+    out_f: i64,
+    out_h: i64,
+    out_w: i64,
+    _tile_f: i64,
+    tile_h: i64,
+    tile_w: i64,
+) -> f64 {
+    let out_voxels = (out_f * out_h * out_w) as f64;
+    let frame_px = (tile_h * tile_w) as f64;
+    (WAN22_VAE_ACCUM_BYTES_PER_VOXEL as f64 * out_voxels
+        + WAN22_VAE_FRAME_BYTES_PER_OUT_PX as f64 * frame_px)
+        / GIB_F64
+}
+
+/// Conservative single-pass causal z48 VAE decode working-set peak in bytes.
+///
+/// This is the full-output case of the calibrated streaming cost function consumed by the actual
+/// budget planner. It excludes DiT and text-encoder composition weights.
+pub fn conservative_video_decode_peak_bytes(width: u32, height: u32, frames: u32) -> Option<u64> {
+    let frame_pixels = u64::from(width).checked_mul(u64::from(height))?;
+    let output_voxels = frame_pixels.checked_mul(u64::from(frames))?;
+    if output_voxels == 0 {
+        return None;
+    }
+    WAN22_VAE_ACCUM_BYTES_PER_VOXEL
+        .checked_mul(output_voxels)?
+        .checked_add(WAN22_VAE_FRAME_BYTES_PER_OUT_PX.checked_mul(frame_pixels)?)
+}
+
+/// The safe peak-GiB budget for the z48 vae22 decode tiler — **free-aware** (sc-12734). The decode
+/// runs after the denoise, so it budgets against **FREE** VRAM, not `0.85×TOTAL`; over-budgeting on
+/// top of the resident weights + cudarc pool is exactly what drove the q8 / i2v-q4 OOMs into the
+/// decode. Resolved in order: `WAN_VAE_BUDGET_GIB` env override (positive float — the deterministic
+/// injection point for the worker/tests) → **free** VRAM × `WAN22_VAE_BUDGET_SAFE_FRAC` (via the live
+/// trusted-path `nvidia-smi memory.free` probe of the render's PINNED device
+/// [`candle_gen::gpu::nvidia_smi_rendered_free_gib`] — `total − used` on Candle's `cuda:0`, NOT the min
+/// across all GPUs, so a busy co-tenant card can't poison it (sc-13298); an absolute System32/CUDA_PATH
+/// binary, never a bare `PATH` lookup; sc-9014 / F-030) → `WAN22_VAE_DEFAULT_BUDGET_GIB`.
+///
+/// Blast radius: this opts the Wan tiler into the free-aware sibling resolver; the LTX tiler keeps the
+/// total-based [`vae_tiling::safe_budget_gib`] unchanged.
+pub fn wan22_vae_safe_budget_gib() -> f64 {
+    vae_tiling::free_aware_safe_budget_gib(
+        WAN22_VAE_BUDGET_ENV,
+        WAN22_VAE_BUDGET_SAFE_FRAC,
+        WAN22_VAE_DEFAULT_BUDGET_GIB,
+    )
+}
+
+/// **Memory-budgeted** spatial tiling for the z48 vae22 decode — routes the shared `budgeted_plan`
+/// selector through the vae22 cost model. Caller passes the **output** dims. `Ok(None)` → a single
+/// high-res frame already fits (streaming single-pass); `Ok(Some)` → the largest spatial tile that
+/// fits; `Err` → a catchable over-budget signal returned before the decode (not an OOM).
+pub fn auto_tiling_budgeted_wan22(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+) -> Result<Option<TilingConfig>> {
+    plan_wan22_tiling(height, width, out_frames, wan22_vae_safe_budget_gib())
+}
+
+/// Live-budgeted selector for an admitted rung-2 maximum tile edge. Unlike the legacy automatic
+/// path, the selected path cannot return a single-pass plan: every advertised edge is below Wan's
+/// minimum output side, and the full-frame cost is made ineligible while the ordinary candidate
+/// costs and accumulator floor remain unchanged.
+pub fn auto_tiling_budgeted_wan22_capped(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+    max_tile_edge: u32,
+) -> Result<Option<TilingConfig>> {
+    plan_wan22_tiling_capped(
+        height,
+        width,
+        out_frames,
+        wan22_vae_safe_budget_gib(),
+        max_tile_edge,
+    )
+}
+
+/// Pure vae22 spatial tile selector (the `safe_gib` ceiling injected so it is unit-testable without a
+/// GPU). Supplies the vae22 candidate grid + cost model to the shared [`budgeted_plan`]; same
+/// `Ok(None)` / `Ok(Some)` / catchable-`Err` contract as the LTX half.
+fn plan_wan22_tiling(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+    safe_gib: f64,
+) -> Result<Option<TilingConfig>> {
+    // Shared budgeted selector + error mapping (sc-9006 / F-026); wan-specific: the spatial-only
+    // candidate grid (no temporal candidates — `decode` streams temporally) and the streaming
+    // cost model `estimated_wan22_decode_peak_gib`.
+    let candidates = TileCandidates {
+        spatial_px: &WAN22_VAE_SPATIAL_PX,
+        spatial_overlap_px: 64,
+        temporal: &WAN22_VAE_TEMPORAL_FR,
+        temporal_overlap_policy: TemporalOverlapPolicy::Candidate,
+    };
+    vae_tiling::plan_tiling(
+        "wan z48 vae22 decode",
+        WanVae::VAE_TILING,
+        height,
+        width,
+        out_frames,
+        safe_gib,
+        candidates,
+        estimated_wan22_decode_peak_gib,
+    )
+}
+
+fn plan_wan22_tiling_capped(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+    safe_gib: f64,
+    max_tile_edge: u32,
+) -> Result<Option<TilingConfig>> {
+    let max_tile_edge = i32::try_from(max_tile_edge).map_err(|_| {
+        candle_gen::candle_core::Error::Msg("wan z48 decode tile cap exceeds i32".into())
+    })?;
+    let spatial = WAN22_VAE_SPATIAL_PX
+        .into_iter()
+        .filter(|&edge| edge <= max_tile_edge)
+        .collect::<Vec<_>>();
+    if spatial.is_empty() {
+        candle_gen::candle_core::bail!(
+            "wan z48 vae22 decode: tile cap {max_tile_edge} is below the smallest production candidate"
+        );
+    }
+    let candidates = TileCandidates {
+        spatial_px: &spatial,
+        spatial_overlap_px: 64,
+        temporal: &WAN22_VAE_TEMPORAL_FR,
+        temporal_overlap_policy: TemporalOverlapPolicy::Candidate,
+    };
+    let result = vae_tiling::plan_tiling(
+        "wan z48 vae22 decode",
+        WanVae::VAE_TILING,
+        height,
+        width,
+        out_frames,
+        safe_gib,
+        candidates,
+        |out_f, out_h, out_w, tile_f, tile_h, tile_w| {
+            if tile_h >= out_h && tile_w >= out_w {
+                f64::INFINITY
+            } else {
+                estimated_wan22_decode_peak_gib(out_f, out_h, out_w, tile_f, tile_h, tile_w)
+            }
+        },
+    )?;
+    result.map(Some).ok_or_else(|| {
+        candle_gen::candle_core::Error::Msg(
+            "wan z48 vae22 decode: selected bounded decode unexpectedly resolved to single pass"
+                .into(),
+        )
+    })
+}
+
+#[cfg(test)]
+mod encoder_tests {
+    use super::{patchify_encoder_input, AvgDown};
+    use candle_gen::candle_core::{Device, Result, Tensor};
+
+    #[test]
+    fn z48_patchify_matches_mlx_channel_r_q_order() -> Result<()> {
+        let device = Device::Cpu;
+        let video = Tensor::from_vec(vec![0f32, 1.0, 2.0, 3.0], (1, 1, 1, 2, 2), &device)?;
+        let patchified = patchify_encoder_input(&video, 2)?;
+        assert_eq!(patchified.dims(), &[1, 4, 1, 1, 1]);
+        assert_eq!(
+            patchified.flatten_all()?.to_vec1::<f32>()?,
+            vec![0.0, 2.0, 1.0, 3.0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn z48_residual_down_shortcut_applies_causal_temporal_padding() -> Result<()> {
+        let device = Device::Cpu;
+        let input = Tensor::from_vec(
+            (0..12).map(|v| v as f32).collect(),
+            (1, 1, 3, 2, 2),
+            &device,
+        )?;
+        let output = AvgDown::new(1, 1, 2, 2).forward(&input)?;
+        assert_eq!(output.dims(), &[1, 1, 2, 1, 1]);
+        // Leading zero-frame + frame 0, then frames 1+2; each output averages a 2x2x2 block.
+        assert_eq!(output.flatten_all()?.to_vec1::<f32>()?, vec![0.75, 7.5]);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn public_decode_peak_is_the_planners_full_output_case() {
+        assert_eq!(
+            conservative_video_decode_peak_bytes(64, 64, 9),
+            Some(382_730_240)
+        );
+        assert_eq!(conservative_video_decode_peak_bytes(64, 0, 9), None);
+        assert_eq!(
+            conservative_video_decode_peak_bytes(u32::MAX, u32::MAX, u32::MAX),
+            None
+        );
+    }
+
+    #[test]
+    fn selected_decode_cap_forces_tiling_and_intersects_the_live_budget() {
+        let generous = plan_wan22_tiling_capped(480, 832, 81, 100.0, 448)
+            .unwrap()
+            .expect("selected bounded decode must not fall through to single pass");
+        assert_eq!(generous.spatial.unwrap().tile_px, 448);
+
+        let tighter = plan_wan22_tiling_capped(480, 832, 81, 18.0, 448)
+            .unwrap()
+            .expect("a smaller candidate must satisfy the tighter live budget");
+        assert!(tighter.spatial.unwrap().tile_px < 448);
+
+        let selected_256 = plan_wan22_tiling_capped(480, 832, 81, 100.0, 256)
+            .unwrap()
+            .expect("the selected cap must constrain the candidate grid");
+        assert_eq!(selected_256.spatial.unwrap().tile_px, 256);
+    }
+    use std::cell::Cell;
+
+    #[test]
+    fn compatibility_error_bridge_keeps_geometry_refusal_details() {
+        let bridged = candle_error(CandleError::GeometryRefused {
+            reason: "requested geometry is not feasible".to_owned(),
+            requested_width: 1536,
+            requested_height: 1024,
+            alternative: None,
+        });
+        let message = bridged.to_string();
+
+        assert!(message.contains("requested geometry is not feasible"));
+        assert!(message.contains("1536x1024"));
+        assert!(message.contains("verified alternative: None"));
+    }
+
+    #[test]
+    fn streaming_driver_cancels_between_chunks_and_cleans_up() {
+        let cancel = CancelFlag::new();
+        let decoded = Cell::new(0usize);
+        let resets = Cell::new(0usize);
+        let result = run_streaming_chunks(
+            4,
+            &cancel,
+            |i| {
+                decoded.set(decoded.get() + 1);
+                if i == 0 {
+                    cancel.cancel();
+                }
+                Ok(i)
+            },
+            || resets.set(resets.get() + 1),
+        );
+        assert!(matches!(result, Err(CandleError::Canceled)));
+        assert_eq!(decoded.get(), 1, "cancel must stop before the second chunk");
+        assert_eq!(
+            resets.get(),
+            2,
+            "caches reset before and after cancellation"
+        );
+
+        let before_decode = CancelFlag::new();
+        let on_progress = |progress| {
+            if matches!(progress, candle_gen::gen_core::Progress::Decoding) {
+                before_decode.cancel();
+            }
+        };
+        on_progress(candle_gen::gen_core::Progress::Decoding);
+        decoded.set(0);
+        resets.set(0);
+        let result = preflight_streaming_decode(&before_decode, || resets.set(resets.get() + 1));
+        assert!(matches!(result, Err(CandleError::Canceled)));
+        assert_eq!(decoded.get(), 0, "pre-decode cancel must skip frame zero");
+        assert_eq!(resets.get(), 1, "preflight cancellation must reset caches");
+    }
+
+    #[test]
+    fn streaming_driver_preserves_noncancel_output_and_cleans_errors() {
+        let resets = Cell::new(0usize);
+        let chunks = run_streaming_chunks(
+            3,
+            &CancelFlag::default(),
+            |i| Ok(i * 2),
+            || resets.set(resets.get() + 1),
+        )
+        .unwrap();
+        assert_eq!(chunks, vec![0, 2, 4]);
+        assert_eq!(resets.get(), 2);
+
+        resets.set(0);
+        let result = run_streaming_chunks::<usize>(
+            3,
+            &CancelFlag::default(),
+            |i| {
+                if i == 1 {
+                    Err(CandleError::Msg("decode failed".into()))
+                } else {
+                    Ok(i)
+                }
+            },
+            || resets.set(resets.get() + 1),
+        );
+        assert!(matches!(result, Err(CandleError::Msg(_))));
+        assert_eq!(resets.get(), 2, "caches reset after decoder errors too");
+    }
+
+    #[test]
+    fn wan22_tiling_single_pass_when_small() {
+        // A short, low-res clip fits a single streaming decode → no tiling.
+        assert!(plan_wan22_tiling(256, 256, 25, 60.0).unwrap().is_none());
+    }
+
+    #[test]
+    fn wan22_tiling_bounds_high_res_frame_peak() {
+        // A 1280×1280 frame's single-pass activation spike (~76 GiB measured) blows a 48 GiB-class
+        // budget; the selector must tile spatially and keep the recomputed peak under the safe ceiling
+        // (bounded/catchable). 48 GiB (not 24) because the CUDA-calibrated accumulator floor for a
+        // 1280²×97 video is ~24 GiB on its own — a 24 GiB tier genuinely cannot assemble it (the model
+        // correctly returns AccumulatorsExceedBudget there; see the unfittable test).
+        let safe = 48.0 * 0.85;
+        let cfg = plan_wan22_tiling(1280, 1280, 97, safe)
+            .unwrap()
+            .expect("high-res frame must tile spatially");
+        // Spatial-only: the selector never tiles the temporal axis here.
+        assert!(cfg.spatial.is_some(), "expected a spatial tile");
+        assert!(
+            cfg.temporal.is_none(),
+            "candle decode streams temporally — no temporal tiling"
+        );
+        let th = cfg
+            .spatial
+            .map(|s| (s.tile_px as i64).min(1280))
+            .unwrap_or(1280);
+        let peak = estimated_wan22_decode_peak_gib(97, 1280, 1280, 97, th, th);
+        assert!(peak <= safe, "chosen peak {peak:.1} over safe {safe:.1}");
+    }
+
+    #[test]
+    fn wan22_tiling_errors_when_unfittable() {
+        // 4K × 257 frames under 8 GiB: the output accumulators alone blow it → catchable, not an OOM.
+        assert!(plan_wan22_tiling(2160, 3840, 257, 8.0).is_err());
+    }
+
+    #[test]
+    fn wan22_budget_env_override_wins() {
+        // The deterministic injection point the worker/tests use. (Set/clear in-process.)
+        std::env::set_var("WAN_VAE_BUDGET_GIB", "42.5");
+        assert_eq!(wan22_vae_safe_budget_gib(), 42.5);
+        std::env::remove_var("WAN_VAE_BUDGET_GIB");
+    }
+
+    #[test]
+    fn wan22_free_aware_budget_picks_smaller_tile_than_total() {
+        // sc-12734 core AC: with N GB left resident by the denoise, the FREE-aware budget picks a
+        // strictly smaller decode tile than `0.85×TOTAL` would. Same 96 GiB card, same 1280²×49 clip.
+        let total = 96.0;
+        let frac = WAN22_VAE_BUDGET_SAFE_FRAC; // 0.85
+        let resident = 60.0; // weights + cudarc pool the denoise left resident
+
+        // What the OLD total-based budget resolves to (== safe_budget_gib on a GPU box): total × frac.
+        let total_budget = total * frac;
+        // The NEW free-aware budget: (total − resident) × frac, via the shared pure helper.
+        let free_budget = vae_tiling::free_aware_budget_gib(total - resident, frac);
+        assert!(
+            free_budget < total_budget,
+            "resident weights must shrink the budget: free {free_budget:.1} !< total {total_budget:.1}"
+        );
+
+        let big = plan_wan22_tiling(1280, 1280, 49, total_budget)
+            .unwrap()
+            .expect("total-based budget still tiles this high-res frame")
+            .spatial
+            .expect("spatial tile")
+            .tile_px;
+        let small = plan_wan22_tiling(1280, 1280, 49, free_budget)
+            .unwrap()
+            .expect("free-aware budget tiles")
+            .spatial
+            .expect("spatial tile")
+            .tile_px;
+        assert!(
+            small < big,
+            "free-aware selection must pick a strictly smaller tile: {small} !< {big}"
+        );
+        // …but NO smaller than needed: it takes the largest tile that fits, not the floor candidate
+        // (budgeted_plan never over-tiles past the speed cliff).
+        let smallest_candidate = *WAN22_VAE_SPATIAL_PX.last().unwrap();
+        assert!(
+            small > smallest_candidate,
+            "must not over-tile to the smallest candidate {smallest_candidate} when a larger tile fits"
+        );
+    }
+
+    #[test]
+    fn wan22_free_aware_budget_respects_accumulator_floor() {
+        // If the denoise leaves so little free that even the full-output accumulator floor won't fit,
+        // the tiler returns a catchable Err (AccumulatorsExceedBudget) rather than tiling BELOW the
+        // floor into a guaranteed OOM. 1280²×49's accumulator floor is ~12 GiB; a ~6.8 GiB free budget
+        // (8 GiB free × 0.85) is under it.
+        let tiny_free = vae_tiling::free_aware_budget_gib(8.0, WAN22_VAE_BUDGET_SAFE_FRAC);
+        assert!(
+            plan_wan22_tiling(1280, 1280, 49, tiny_free).is_err(),
+            "a below-floor free budget must be a catchable Err, not a sub-floor tile"
+        );
+    }
+
+    /// sc-7148: the calibrated streaming cost model must stay **conservative** against the real CUDA
+    /// peak-VRAM anchors (RTX PRO 6000 Blackwell, sm_120, f32, real Wan2.2-TI2V-5B z48 weights) it was
+    /// fit from — `estimated ≥ measured` for every anchor (never under-predict ⇒ the selector never OKs
+    /// a tile / single-pass that OOMs), and not absurdly over (≤ 2.5×). Regenerate with `cargo test -p
+    /// candle-gen-wan --features cuda --release --test vae_decode_sweep -- --ignored --nocapture` after
+    /// a decoder or candle-allocator change.
+    #[test]
+    fn wan22_decode_peak_matches_cuda_anchors() {
+        // (out_f, out_h, out_w, tile_h, tile_w, measured_peak_gib). `tile_f` is unused by the streaming
+        // model (passed as out_f). Single-pass ⇒ tile == out (the full-frame spike).
+        let anchors: [(i64, i64, i64, i64, i64, f64); 5] = [
+            (13, 768, 768, 768, 768, 29.1748),
+            (13, 1280, 1280, 1280, 1280, 76.4561),
+            (13, 1280, 1280, 256, 256, 6.2998),
+            (13, 1280, 1280, 512, 512, 22.8672),
+            (61, 1280, 1280, 256, 256, 17.2109),
+        ];
+        for (of, oh, ow, th, tw, measured) in anchors {
+            let est = estimated_wan22_decode_peak_gib(of, oh, ow, of, th, tw);
+            assert!(
+                est >= measured,
+                "under-predicts {ow}x{oh}x{of} tile {tw}x{th}: est {est:.2} < measured {measured:.2} GiB"
+            );
+            assert!(
+                est <= measured * 2.5,
+                "over-predicts {ow}x{oh}x{of} tile {tw}x{th}: est {est:.2} > 2.5x measured {measured:.2} GiB"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod norm_tests {
+    //! sc-12818: `ChanNorm` (the shared channel-L2 norm) reduces in f32 so it stays stable under the
+    //! A14B's bf16 z16 VAE, applying the per-position scalar back in the working dtype (so the bf16
+    //! activation stays bf16). These pin (a) the f32-reduction keeps a bf16 forward close to the f32
+    //! reference over a wide channel count, and (b) the forward preserves the input activation dtype.
+    //! candle's CPU backend has bf16 *storage* + elementwise/reductions (only matmul/conv are missing),
+    //! so both run on CPU.
+    use super::ChanNorm;
+    use candle_gen::candle_core::{DType, Device, Result, Tensor};
+    use candle_gen::candle_nn::VarBuilder;
+    use std::collections::HashMap;
+
+    fn build(gamma: &Tensor, c: usize, dt: DType, dev: &Device) -> Result<ChanNorm> {
+        let mut map = HashMap::new();
+        map.insert("gamma".to_string(), gamma.to_dtype(dt)?);
+        ChanNorm::new(c, VarBuilder::from_tensors(map, dt, dev))
+    }
+
+    #[test]
+    fn chan_norm_bf16_stays_close_to_f32_and_preserves_dtype() -> Result<()> {
+        let dev = Device::Cpu;
+        let c = 384usize; // the z16 mid width — a wide channel-L2 where a naive bf16 sum would drift
+        let gamma = Tensor::randn(0f32, 1.0, c, &dev)?;
+        let x = Tensor::randn(0f32, 1.0, (1, c, 1, 4, 4), &dev)?;
+
+        let out_f32 = build(&gamma, c, DType::F32, &dev)?.forward(&x)?;
+        let out_bf16 = build(&gamma, c, DType::BF16, &dev)?.forward(&x.to_dtype(DType::BF16)?)?;
+
+        // The bf16 forward keeps a bf16 activation (the VRAM win — only the reduction transits f32).
+        assert_eq!(
+            out_bf16.dtype(),
+            DType::BF16,
+            "bf16 input must yield a bf16 activation"
+        );
+
+        let a = out_f32.flatten_all()?.to_vec1::<f32>()?;
+        let b = out_bf16
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let max_rel = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs() / x.abs().max(1e-2))
+            .fold(0f32, f32::max);
+        // bf16 has ~7 mantissa bits ⇒ ~1% per-element rounding; the f32 channel-L2 reduction keeps the
+        // whole norm well inside a loose 5% band (a naive bf16 sum over 384 channels would blow this).
+        assert!(
+            max_rel < 0.05,
+            "bf16 ChanNorm drifted from the f32 reference: max relative diff {max_rel}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn chan_norm_f32_forward_is_unchanged() -> Result<()> {
+        // The f32 path must be byte-for-byte what it always was (the z48 5B decode still runs f32): the
+        // two `to_dtype(F32)` casts collapse to identity, so recompute the exact pre-sc-12818 formula
+        // and require bit-equality.
+        let dev = Device::Cpu;
+        let c = 96usize;
+        let gamma = Tensor::randn(0f32, 1.0, c, &dev)?;
+        let x = Tensor::randn(0f32, 1.0, (1, c, 2, 3, 3), &dev)?;
+        let cn = build(&gamma, c, DType::F32, &dev)?;
+        let got = cn.forward(&x)?;
+
+        // The exact pre-change reduction: x.sqr().sum_keepdim(1).sqrt().clamp(1e-12, 1e30).
+        let l2 = x.sqr()?.sum_keepdim(1)?.sqrt()?.clamp(1e-12, 1e30)?;
+        let normed = (x.broadcast_div(&l2)? * (c as f64).sqrt())?;
+        let expected = normed.broadcast_mul(&gamma.reshape((1, c, 1, 1, 1))?)?;
+
+        let g = got.flatten_all()?.to_vec1::<f32>()?;
+        let e = expected.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(
+            g, e,
+            "the f32 ChanNorm forward must be bit-identical to pre-sc-12818"
+        );
+        Ok(())
+    }
+}

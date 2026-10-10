@@ -1,0 +1,39 @@
+[package]
+name = "runtime-macos"
+version = "0.0.0"
+edition = "2021"
+description = "Supported SceneWorks MLX media and LLM runtime composition for Apple silicon macOS."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+
+[dependencies]
+runtime-catalog = { workspace = true }
+mlx-gen-catalog = { workspace = true, optional = true }
+# The Candle audio lane (sc-12835): the sanctioned cross-backend seam — the mlx macOS bundle
+# carries its audio generators on candle through the catalog's dedicated audio section
+# (docs/architecture/audio-backend-strategy.md). Candle-CPU on this platform today.
+candle-audio-catalog = { workspace = true, optional = true }
+# The lane's candle snapshot preparer (never in the mlx-only main preparer registry) now rides
+# inside candle-audio-catalog's composed registration (sc-12836) — the catalog owns the
+# candle-llm delegation, so this bundle no longer names candle-llm directly.
+mlx-llm = { workspace = true }
+
+[features]
+default = ["media", "audio"]
+# SceneWorks consumes the complete bundle. LLM-only products can disable default features without
+# falling back to separate backend dependencies or linker-driven provider discovery.
+media = ["dep:mlx-gen-catalog"]
+# The Candle audio lane (sc-12835, docs/architecture/audio-backend-strategy.md). A separate
+# additive feature — NOT folded into `media` — so an LLM-only product (ChatWorks) can compose
+# text + TTS via `--no-default-features --features audio` without the mlx media provider graph.
+audio = ["dep:candle-audio-catalog"]
+# Run the Candle audio lane on Metal (sc-13698; unblocks the SceneWorks sc-13501 consumer). Additive
+# over `audio`: forwards `candle-audio-catalog/metal` so the audio providers use the Metal GPU (~38x
+# steady on the diffusion models — moss-sfx, acestep — sc-13039 PR #170). The whole lane runs on
+# Metal: the nearest-upsample vocoders (Kokoro, Chatterbox) used to be force-routed to CPU here
+# because candle-core's Metal backend lacks upsample_nearest1d, but that call is routed through the
+# backend-agnostic candle_audio::ops::nearest_upsample1d (sc-13691 / sc-13886) and both were
+# validated generating on Metal, so sc-15074 retired the override. Metal is macOS-only, so only this
+# bundle exposes it; runtime-cuda already forwards the audio catalog's cuda feature and runtime-cpu
+# has no GPU lane.
+audio-metal = ["audio", "candle-audio-catalog/metal"]

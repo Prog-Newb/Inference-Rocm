@@ -1,0 +1,90 @@
+[package]
+name = "candle-audio-catalog"
+version = "0.0.0"
+edition = "2021"
+description = "Explicit complete provider catalog for the SceneWorks Candle audio lane — the audio composition root every runtime bundle's audio section consumes."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+
+[dependencies]
+# Family core crate — re-exports gen_core + candle, so every audio provider links exactly one
+# gen-core / candle build (the same single-resolution discipline as candle-gen-catalog).
+candle-audio = { path = "../candle-audio" }
+# Audio provider crates, in catalog order (sc-12836: Kokoro TTS; sc-12841: MOSS-SoundEffect
+# SFX/ambience; sc-12844: Chatterbox voice encoder — a VoiceEmbedder, not a generator; sc-13223:
+# OpenVoice V2 voice conversion — the first real AudioTransform).
+candle-audio-kokoro = { path = "../candle-audio-kokoro" }
+candle-audio-moss-sfx = { path = "../candle-audio-moss-sfx" }
+candle-audio-acestep = { path = "../candle-audio-acestep" }
+# sc-14543 / sc-14544: Stable Audio 3 small-music and small-sfx — 44.1 kHz stereo text-to-audio
+# diffusion. Two registered post-trained checkpoints on one architecture. The SFX variant overlaps
+# in intent with candle-audio-moss-sfx but is a different tier and output shape (44.1 kHz stereo up
+# to 120 s, against MOSS-SoundEffect's 48 kHz mono).
+candle-audio-stable-audio-3 = { path = "../candle-audio-stable-audio-3" }
+# sc-13392: MOSS-TTS-Realtime — streaming TTS (Qwen3-1.7B AR brain + the ported MOSS-Audio-Tokenizer
+# RLFQ codec). The audio lane's first streaming generator.
+candle-audio-moss-tts-realtime = { path = "../candle-audio-moss-tts-realtime" }
+# sc-13518: MOSS-TTSD (moss_ttsd_v05) — multi-speaker dialogue TTS (Qwen3 delay-pattern AR brain +
+# the ported OpenMOSS XY_Tokenizer codec). A Generator, in catalog order after the MMAudio generators.
+candle-audio-moss-tts = { path = "../candle-audio-moss-tts" }
+# sc-13239: Chatterbox clone-TTS (chatterbox_tts) — the zero-shot voice-cloning speech generator
+# (T3 LM → S3Gen token→waveform → PerTh watermark). A Generator, in catalog order after the
+# MOSS-TTS-Realtime generator; releases the sc-12838 clone gate.
+candle-audio-chatterbox = { path = "../candle-audio-chatterbox" }
+candle-audio-chatterbox-ve = { path = "../candle-audio-chatterbox-ve" }
+candle-audio-openvoice = { path = "../candle-audio-openvoice" }
+# sc-12850: Whisper ASR — the first real Transcriber (audio→text, the Captioner-analog kind).
+candle-audio-whisper = { path = "../candle-audio-whisper" }
+# sc-12851: LAION CLAP — the first real AudioEmbedder (semantic audio-text joint-space retrieval).
+candle-audio-clap = { path = "../candle-audio-clap" }
+# sc-12843: MMAudio (mmaudio_small_16k) — the audio lane's first video→audio (Foley) Generator:
+# a silent clip's RGB frames (VideoSync conditioning) + optional prompt → a synchronized 16 kHz
+# soundtrack (DFN5B-CLIP + Synchformer conditioners → MM-DiT flow-matching → mel-VAE + BigVGAN).
+candle-audio-mmaudio = { path = "../candle-audio-mmaudio" }
+# The audio lane's snapshot-preparer composition (sc-12836): the lane's single `candle`
+# registration recognizes audio snapshots and delegates everything else to candle-llm's
+# preparer unchanged. This crate is the composition owner (previously each bundle wired
+# candle-llm's registry into the lane directly); candle-llm re-exports `core_llm` so the
+# preparer contract types resolve to one package.
+candle-llm = { workspace = true }
+
+[features]
+default = []
+# Pass the backend selection through so a bundle's `--features metal`/`cuda` on this catalog
+# selects the matching candle backend across the whole audio family (mirrors candle-gen-catalog).
+metal = [
+    "candle-audio/metal",
+    "candle-audio-kokoro/metal",
+    "candle-audio-moss-sfx/metal",
+    "candle-audio-acestep/metal",
+    "candle-audio-stable-audio-3/metal",
+    "candle-audio-moss-tts-realtime/metal",
+    "candle-audio-chatterbox/metal",
+    "candle-audio-chatterbox-ve/metal",
+    "candle-audio-openvoice/metal",
+    "candle-audio-whisper/metal",
+    "candle-audio-clap/metal",
+    "candle-audio-mmaudio/metal",
+    "candle-audio-moss-tts/metal",
+]
+cuda = [
+    "candle-audio/cuda",
+    "candle-audio-kokoro/cuda",
+    "candle-audio-moss-sfx/cuda",
+    "candle-audio-acestep/cuda",
+    "candle-audio-stable-audio-3/cuda",
+    "candle-audio-moss-tts-realtime/cuda",
+    "candle-audio-chatterbox/cuda",
+    "candle-audio-chatterbox-ve/cuda",
+    "candle-audio-openvoice/cuda",
+    "candle-audio-whisper/cuda",
+    "candle-audio-clap/cuda",
+    "candle-audio-mmaudio/cuda",
+    "candle-audio-moss-tts/cuda",
+]
+
+[dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }

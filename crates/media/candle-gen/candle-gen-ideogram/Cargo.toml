@@ -1,0 +1,45 @@
+[package]
+name = "candle-gen-ideogram"
+version = "0.0.0"
+edition = "2021"
+description = "Ideogram 4 provider crate for candle-gen — the Windows/CUDA sibling of mlx-gen-ideogram."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "diffusion", "ideogram", "inference"]
+categories = ["science"]
+
+[dependencies]
+candle-gen = { path = "../candle-gen" }
+# Ideogram's VAE is the FLUX.2 `AutoencoderKLFlux2` (32-ch, 2×2 patchify, identity scaling) — reuse
+# `candle-gen-flux2`'s `Flux2Vae` verbatim, exactly as `mlx-gen-ideogram` reuses `mlx-gen-flux2`.
+candle-gen-flux2 = { path = "../candle-gen-flux2" }
+# NVIDIA PiD optional super-resolving decoder (epic 7840 / sc-7853): Ideogram 4 reuses the FLUX.2 VAE,
+# so it shares the `flux2` PiD latent-space student (its DiT packs the 128 channels in a DIFFERENT
+# `(ph,pw,c)` order, so the decode branch reconstructs the FLUX.2-canonical packed latent). Wired
+# behind `req.use_pid` (default off → the byte-exact native `Flux2Vae::decode_latent`).
+candle-gen-pid = { path = "../candle-gen-pid" }
+# Deterministic CPU-seeded initial noise (sc-3673 parity).
+rand = { workspace = true }
+rand_distr = { workspace = true }
+serde_json = "1"
+# Read adapter `.safetensors` header metadata for the bundled TurboTime LoRA merge (turbo path).
+safetensors = "0.7"
+
+[features]
+default = []
+metal = ["candle-gen/metal", "candle-gen-flux2/metal", "candle-gen-pid/metal"]
+cuda = ["candle-gen/cuda", "candle-gen-flux2/cuda", "candle-gen-pid/cuda"]
+
+[dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }
+# GPU examples use the phase-aware VRAM probe without exposing test support in the shipped provider.
+candle-gen = { path = "../candle-gen", features = ["testkit"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+sceneworks-gen-core-testkit = { workspace = true }
+# Hash + compare the VAE tensors in the sc-16955 preview-provenance rows: the reuse of epic 16624's
+# 32-channel FLUX.2 RGB fit is grounded in tensor bytes (repo / revision / SHA-256), not in a matching
+# Rust type name. Test-only — nothing in the engine hashes weights.
+sha2 = { workspace = true }

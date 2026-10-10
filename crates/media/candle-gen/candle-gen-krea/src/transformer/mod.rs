@@ -1,0 +1,1310 @@
+//! The Krea 2 dense single-stream DiT (`Krea2Transformer2DModel` / reference `mmdit.py`
+//! `SingleStreamDiT`) forward. Port of `mlx-gen-krea`'s `transformer/mod.rs`.
+//!
+//! ```text
+//!   img_in:        img tokens = Linear(patchify(latent, p=2))          [b, img_len, 6144]
+//!   time_embed:    t   = Linear(GELU(Linear(sinusoid(timestep))))      [b, 1, 6144]
+//!   time_mod_proj: tvec = Linear(GELU(t))                              [b, 1, 6·6144]   (shared modulation)
+//!   text_fusion:   ctx = aggregate(stacked 12 Qwen3-VL layers)         [b, cap, 2560]
+//!   txt_in:        ctx = Linear(GELU(Linear(RMSNorm(ctx))))            [b, cap, 6144]
+//!   combined = [ctx ; img]                                            [b, cap+img_len, 6144]
+//!   28× transformer_blocks (gated single-stream, DoubleSharedModulation, 3-axis RoPE)
+//!   final_layer:   (1+scale)·RMSNorm(x) + shift → Linear(6144→64)      [b, cap+img_len, 64]
+//!   slice image tokens → unpatchify                                   → velocity [b, 16, H, W]
+//! ```
+//!
+//! Per-sample `B = 1`: the text stream arrives already trimmed to its valid length (the candle
+//! tokenizer emits no padding) and the whole sequence runs **unmasked**.
+
+pub mod block;
+pub mod rope;
+
+use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
+use candle_gen::gen_core::attention_budget::AttentionPlan;
+use candle_gen::quant::Nvfp4Context;
+use candle_gen::BlockPlan;
+
+use crate::config::Krea2Config;
+use crate::loader::{linear_detect, linear_detect_planned, Weights};
+use crate::nvfp4_dit::{DitPlan, Nvfp4Report};
+use crate::quant::QLinear;
+use block::{RmsScale, SingleStreamBlock, TextFusionTransformer};
+use rope::RopeTables;
+
+fn request_attention_plan<'a>(
+    scores_budget: usize,
+    cancel: &'a candle_gen::gen_core::CancelFlag,
+) -> AttentionPlan<'a> {
+    AttentionPlan::budgeted(candle_gen::attention::attention_budget_from_usize(
+        scores_budget,
+    ))
+    .with_cancel(cancel)
+}
+
+/// The Krea 2 single-stream DiT.
+pub struct Krea2Transformer {
+    cfg: Krea2Config,
+    device: Device,
+    dtype: DType,
+    img_in: QLinear,
+    time_embed_l1: QLinear,
+    time_embed_l2: QLinear,
+    time_mod_proj: QLinear,
+    txt_in_norm: RmsScale,
+    txt_in_l1: QLinear,
+    txt_in_l2: QLinear,
+    text_fusion: TextFusionTransformer,
+    blocks: TransformerBlocks,
+    final_norm: RmsScale,
+    final_linear: QLinear,
+    final_sstable: Tensor, // [1, 2, hidden]
+    /// Per-render RoPE-table cache (sc-8992 / F-012, made multi-entry in sc-11201 / F-089). The joint
+    /// `(cos, sin)` table depends only on the fixed geometry `(cap_len, ht, wt, n_refs)` — not on the
+    /// flow time / the current latent — so it is identical across every denoise step. Keyed on that
+    /// geometry; hits Arc-clone the stored handles. Bounded to a few entries so the two true-CFG legs
+    /// (cond + uncond, which usually differ in `cap_len`) stay resident and don't evict each other.
+    rope_cache: RopeCache<(usize, usize, usize, usize), (Tensor, Tensor)>,
+}
+
+/// Trunk-block residency. The normal path keeps every block resident. The constrained-card path
+/// retains the read-only mmap and materializes only the current window of blocks on the compute
+/// device, driven by [`candle_gen::block_window::run_windowed`] (SC-15792). The per-block
+/// `Device::synchronize()` this arm used to carry is gone: SC-15791 ablated it at **1.00x** peak on
+/// both the live and reserved counters, so it bought nothing per window. The synchronize that does
+/// matter runs once per forward instead of once per block — 1 per denoise step rather than 28 — and
+/// the driver owns it, on every exit path including cancellation and failure.
+enum TransformerBlocks {
+    Resident(Vec<SingleStreamBlock>),
+    Streamed(std::sync::Arc<Weights>),
+}
+
+/// The shipped rung-4 window for the Candle realization: **one block**.
+///
+/// This deliberately contradicts MLX, where SC-15744 recommended 2–4 to amortize page-cache re-reads.
+/// SC-16096 invalidated SC-15791's original timing mechanism by replacing per-window format
+/// conversion with device-format sidecars. SC-16154 therefore measured the new path rather than
+/// inheriting the old answer: release build, real q4 packed weights, 12 balanced interleaved samples
+/// per window on device 0 of a 2× RTX PRO 6000 Blackwell host (**95.6 GiB VRAM per GPU**), with
+/// sidecar preparation and a full warm-up excluded from the clock.
+///
+/// | window | median step | full min–max spread | paired mean delta vs 1 (95% CI) |
+/// |---:|---:|---:|---:|
+/// | 1 | 2.0423 s | 1.6311–2.3491 s | reference |
+/// | 2 | 2.0027 s | 1.6234–2.4844 s | +0.0416 s (-0.0984–+0.1817) |
+/// | 4 | 1.9914 s | 1.6957–2.4211 s | -0.0091 s (-0.1403–+0.1222) |
+/// | 8 | 1.8468 s | 1.7265–2.2018 s | -0.0651 s (-0.2120–+0.0818) |
+/// | 15 | 1.9286 s | 1.7662–2.4683 s | +0.0193 s (-0.1461–+0.1847) |
+/// | 30 | 2.0813 s | 1.7697–2.6964 s | +0.1911 s (+0.0298–+0.3524) |
+///
+/// **Paired time is flat through window 15 and increasing at window 30.** Every window 2–15
+/// confidence interval includes zero. Window 30 is +191 ms slower within round and its interval
+/// excludes zero; the fitted median gradient across all windows is +2.0 ms per additional block.
+/// Window 8's apparent -9.6% median is not a demonstrated decrease because its paired interval spans
+/// -212 to +82 ms. There is no resolved speed case that favours a wider rung-4 window.
+///
+/// The memory half remains linear through the shipped driver:
+/// `peak(window) ≈ 107.9·window + 153.4 MiB` (SC-15792), a 13.0× live reduction at window 1 against
+/// resident. A wider window therefore spends 107.9 MiB per additional block for no resolved time
+/// saving. Rung 4 is reached only after cheaper strategies cannot fit, so its caller is by
+/// construction VRAM-constrained; latency-sensitive callers with enough VRAM use a cheaper
+/// resident/staged rung instead. The explicit trade is therefore to keep window 1 as both the
+/// minimum-peak default and the only published candidate.
+///
+/// The driver still takes the window as a parameter rather than baking this in: a bound that is only
+/// ever exercised at its tightest setting is a bound nothing has measured, and the peak-by-window
+/// evidence for this rung is produced by driving the real implementation across `w`.
+pub const DEFAULT_TRANSFORMER_WINDOW: usize = 1;
+
+/// Materialize a whole rung-4 window's trunk blocks onto the compute device, in order.
+///
+/// A named function rather than a closure inside the driver call, and that is the point. The rung's
+/// bound is `window x per-block bytes`, which holds only if every block in the window is live at
+/// once: loading each block inside the forward loop instead would hold **one** at a time and
+/// silently execute a window of 1 whatever was asked for — correct output, no bound, no error, and
+/// no test would notice. Adversarial review of SC-15792 confirmed that by hand-mutation: inlining
+/// the load left all 199 crate tests green. Extracted so the regression is a visible deletion and so
+/// `a_window_materializes_every_block_before_any_of_them_runs` can assert the count directly.
+fn materialize_window(
+    view: &Weights,
+    cfg: &Krea2Config,
+    dit_plan: &DitPlan,
+    range: std::ops::Range<usize>,
+) -> Result<Vec<SingleStreamBlock>> {
+    range
+        .map(|i| {
+            SingleStreamBlock::load_planned(
+                view,
+                &format!("transformer_blocks.{i}"),
+                cfg.num_attention_heads,
+                cfg.num_kv_heads,
+                cfg.attention_head_dim,
+                cfg.hidden_size,
+                cfg.norm_eps,
+                dit_plan,
+            )
+        })
+        .collect()
+}
+
+/// Fold a render state through a block sequence with a cancellation checkpoint before every block.
+///
+/// Used by the **resident** trunk paths. The streamed path runs on
+/// [`candle_gen::block_window::run_windowed`] instead (SC-15792) — it needs window arithmetic and a
+/// release discipline this helper does not model, and re-deriving those per family is the fork that
+/// rung 4 exists to prevent. The two agree on cancellation granularity: one checkpoint per block.
+fn fold_block_sequence<T>(
+    num_blocks: usize,
+    cancel: &candle_gen::gen_core::CancelFlag,
+    mut state: T,
+    mut apply: impl FnMut(usize, T) -> candle_gen::Result<T>,
+) -> candle_gen::Result<T> {
+    for index in 0..num_blocks {
+        candle_gen::check_cancel(cancel)?;
+        state = apply(index, state)?;
+    }
+    Ok(state)
+}
+
+/// How many distinct RoPE geometries to keep cached per render. Under true CFG each denoise step
+/// runs two forwards (cond + uncond) whose contexts usually differ in `cap_len`, i.e. two geometries
+/// alternate across the render. A single-entry cache thrashed — evicting + rebuilding the host trig
+/// tables (plus an H2D upload) on every forward (sc-11201 / F-089). Holding a few entries keeps both
+/// legs resident; the small headroom absorbs any incidental extra geometry.
+pub(crate) const ROPE_CACHE_CAP: usize = 4;
+
+/// A tiny bounded, geometry-keyed cache for the per-render RoPE tables (sc-8992 / F-012, sc-11201 /
+/// F-089). Holds up to [`ROPE_CACHE_CAP`] distinct geometries so both true-CFG legs stay resident
+/// across every denoise step instead of evicting each other on every forward. On a miss the value is
+/// built and inserted; on overflow the oldest entry is evicted (FIFO — with two alternating keys and
+/// `cap ≥ 2` no eviction ever happens once both are cached). Hits clone the (Arc-backed) `V`.
+/// `Mutex` (not `RefCell`): the DiT is shared as `Arc<…>` (`Send + Sync`).
+pub(crate) struct RopeCache<K, V> {
+    entries: std::sync::Mutex<Vec<(K, V)>>,
+    cap: usize,
+}
+
+impl<K: PartialEq, V: Clone> RopeCache<K, V> {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            entries: std::sync::Mutex::new(Vec::new()),
+            cap,
+        }
+    }
+
+    /// Return the cached value for `key`, building + inserting it on a miss.
+    pub(crate) fn get_or_build(&self, key: K, build: impl FnOnce() -> Result<V>) -> Result<V> {
+        let mut guard = candle_gen::lock_recover(&self.entries);
+        if let Some((_, v)) = guard.iter().find(|(k, _)| *k == key) {
+            return Ok(v.clone());
+        }
+        let v = build()?;
+        if guard.len() >= self.cap {
+            guard.remove(0);
+        }
+        guard.push((key, v.clone()));
+        Ok(v)
+    }
+}
+
+impl Krea2Transformer {
+    /// Build from a loaded `transformer/` weight set.
+    pub fn load(w: &Weights, cfg: &Krea2Config) -> Result<Self> {
+        Self::load_planned(w, cfg, &DitPlan::baseline())
+    }
+
+    /// [`Self::load`] under an NVFP4 [`DitPlan`] (sc-12110, epic 11037) — the seam that serves the
+    /// trunk's linear projections through [`candle_gen::quant::Nvfp4Linear`], so Krea 2 Turbo can settle
+    /// SC#1 (throughput vs the dense bf16 path) and SC#2 (parity vs the Q4 tier) on real weights.
+    ///
+    /// `DitPlan::baseline()` reproduces [`Self::load`] byte-for-byte — the plan is inert unless it asks
+    /// for NVFP4 or attaches a probe.
+    ///
+    /// # What is served through the plan, and what is not
+    ///
+    /// **In the lane** (260 projections): the 28 single-stream blocks' attention + SwiGLU, the
+    /// `text_fusion` layerwise/refiner blocks', `img_in`, `txt_in.linear_{1,2}`, and
+    /// `final_layer.linear`.
+    ///
+    /// **Out of the lane, deliberately** — `time_embed.linear_{1,2}` and `time_mod_proj`. These are
+    /// batch-1 `[B, 256] → [B, …]` embedders: the FP4 GEMM has nothing to win at `M = 1`, while padding
+    /// M to [`candle_gen::quant::NVFP4_M_ALIGN`] would dominate the call. SANA drew the same line
+    /// (sc-11045). `text_fusion.projector` is excluded too — see `TextFusionTransformer::load_planned`.
+    ///
+    /// # `final_layer.linear` is stated, not inferred
+    ///
+    /// The trunk head is threaded as [`crate::nvfp4_dit::LayerRole::final_proj`] via
+    /// [`DitPlan::act_for_layer`]. The shared policy's name-only fallback anchors on a trailing
+    /// `proj_out` segment and **will not fire** on `final_layer.linear` — relying on it would silently
+    /// leave the head (measured Dense on SANA, crush 438×) on W4A4. That is the sc-12140 defect class,
+    /// pinned by `final_head_is_only_guarded_because_the_loader_states_it`.
+    pub fn load_planned(w: &Weights, cfg: &Krea2Config, plan: &DitPlan) -> Result<Self> {
+        // Bind the plan to THIS trunk's block count so `is_edge_block` names the right last block.
+        let plan = &plan.clone().with_num_layers(cfg.num_layers);
+        // sc-12274: build ONE cuBLASLt handle for this trunk and thread it to every NVFP4 projection.
+        // A handle eagerly allocates a 32 MiB workspace and holds it for life, and nothing on it is
+        // per-layer (its caches are keyed by shape, and every handle on a device already resolves to
+        // the same stream), so one per layer meant 260 × 32 MiB ≈ 6.6 GiB of duplicated scratch that
+        // the weights-only SC#6 sum cannot see. Skipped for a baseline plan, which builds no
+        // `Nvfp4Linear` at all and must stay byte-identical to `load`.
+        let plan = &if plan.is_nvfp4() {
+            plan.clone()
+                .with_nvfp4_context(Nvfp4Context::new(w.device())?)
+        } else {
+            plan.clone()
+        };
+        let (heads, kv, hd, eps) = (
+            cfg.num_attention_heads,
+            cfg.num_kv_heads,
+            cfg.attention_head_dim,
+            cfg.norm_eps,
+        );
+        let hidden = cfg.hidden_size;
+        let blocks = (0..cfg.num_layers)
+            .map(|i| {
+                SingleStreamBlock::load_planned(
+                    w,
+                    &format!("transformer_blocks.{i}"),
+                    heads,
+                    kv,
+                    hd,
+                    hidden,
+                    eps,
+                    plan,
+                )
+            })
+            .collect::<Result<_>>()?;
+        Self::load_front(w, cfg, plan, TransformerBlocks::Resident(blocks))
+    }
+
+    /// Build the DiT front-end/head resident while retaining the block checkpoint as a read-only mmap.
+    /// Each trunk block is loaded, evaluated, synchronized, and dropped in turn by
+    /// [`Self::forward_with_memory`]. This is deliberately limited to the baseline packed/dense path;
+    /// NVFP4 and ConvRot retain their existing resident implementations.
+    pub fn load_block_streamed(
+        weights: std::sync::Arc<Weights>,
+        cfg: &Krea2Config,
+    ) -> Result<Self> {
+        let plan = DitPlan::baseline().with_num_layers(cfg.num_layers);
+        Self::load_front(
+            weights.as_ref(),
+            cfg,
+            &plan,
+            TransformerBlocks::Streamed(weights.clone()),
+        )
+    }
+
+    fn load_front(
+        w: &Weights,
+        cfg: &Krea2Config,
+        plan: &DitPlan,
+        blocks: TransformerBlocks,
+    ) -> Result<Self> {
+        let (hd, eps) = (cfg.attention_head_dim, cfg.norm_eps);
+        let (theads, tkv) = (cfg.text_num_attention_heads, cfg.text_num_kv_heads);
+        let hidden = cfg.hidden_size;
+
+        let final_sstable = w
+            .get("final_layer.scale_shift_table")?
+            .reshape((1, 2, hidden))?;
+
+        Ok(Self {
+            cfg: cfg.clone(),
+            device: w.device().clone(),
+            dtype: w.dtype(),
+            img_in: linear_detect_planned(w, "img_in", true, plan)?,
+            // Batch-1 embedders: out of the NVFP4 lane by design (see the fn docs).
+            time_embed_l1: linear_detect(w, "time_embed.linear_1", true)?,
+            time_embed_l2: linear_detect(w, "time_embed.linear_2", true)?,
+            time_mod_proj: linear_detect(w, "time_mod_proj", true)?,
+            txt_in_norm: RmsScale::load(w, "txt_in.norm.weight", eps)?,
+            txt_in_l1: linear_detect_planned(w, "txt_in.linear_1", true, plan)?,
+            txt_in_l2: linear_detect_planned(w, "txt_in.linear_2", true, plan)?,
+            text_fusion: TextFusionTransformer::load_planned(
+                w,
+                cfg.num_layerwise_text_blocks,
+                cfg.num_refiner_text_blocks,
+                theads,
+                tkv,
+                hd,
+                eps,
+                plan,
+            )?,
+            blocks,
+            final_norm: RmsScale::load(w, "final_layer.norm.weight", eps)?,
+            final_linear: linear_detect_planned(w, "final_layer.linear", true, plan)?,
+            final_sstable,
+            rope_cache: RopeCache::new(ROPE_CACHE_CAP),
+        })
+    }
+
+    /// The device the DiT weights live on — the forward-time residual factors are read on the CPU and
+    /// moved here at install (else the residual matmul is a device mismatch). sc-11105.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Every projection the NVFP4 plan covers, paired with its canonical dotted key — the walk
+    /// [`Self::nvfp4_report`] accounts over. Ordered front-end → text-fusion → blocks → head.
+    fn planned_projections(&self) -> Vec<(String, &QLinear)> {
+        let mut v: Vec<(String, &QLinear)> = vec![
+            ("img_in".to_string(), &self.img_in),
+            ("txt_in.linear_1".to_string(), &self.txt_in_l1),
+            ("txt_in.linear_2".to_string(), &self.txt_in_l2),
+        ];
+        v.extend(self.text_fusion.projections());
+        if let TransformerBlocks::Resident(blocks) = &self.blocks {
+            for (i, b) in blocks.iter().enumerate() {
+                v.extend(b.projections(&format!("transformer_blocks.{i}")));
+            }
+        }
+        v.push(("final_layer.linear".to_string(), &self.final_linear));
+        v
+    }
+
+    /// **Model-level NVFP4 accounting** over the built trunk (sc-12110 SC#6 / SC#4).
+    ///
+    /// Byte-accounting over the actual resident weight buffers — not an `nvidia-smi` free-memory delta —
+    /// so it is immune to GPU contention and allocator/workspace noise. Returns a zeroed report on a
+    /// baseline trunk (nothing quantized), which is itself the SC#4 negative observation off Blackwell:
+    /// an NVFP4 plan on a non-`sm_120` device reports `n_quantized > 0` with `fp4_lit == 0`.
+    pub fn nvfp4_report(&self) -> Nvfp4Report {
+        let mut r = Nvfp4Report::default();
+        for (_, p) in self.planned_projections() {
+            if let Some(l) = p.nvfp4() {
+                r.add(l);
+            }
+        }
+        r
+    }
+
+    /// The canonical dotted keys of every projection the NVFP4 plan covers — so a harness can assert the
+    /// lane's surface (and its size) without reaching into the trunk's private structure.
+    pub fn nvfp4_layer_names(&self) -> Vec<String> {
+        self.planned_projections()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect()
+    }
+
+    /// Walk every adaptable projection, invoking `f(path, &mut QLinear)` once each with the
+    /// projection's canonical DiT dotted path — the single-stream `transformer_blocks.{i}` attention +
+    /// SwiGLU projections plus the `text_fusion.{layerwise,refiner}_blocks.{i}` ones (exactly
+    /// `crate::adapters::merge_surface_keys`). The additive installer
+    /// ([`crate::adapters::install_additive`]) pushes a resolved LoRA/LoKr residual onto each matched
+    /// projection so a user adapter applies on a packed q4/q8 tier with the base kept packed (sc-11105).
+    /// This inner walk covers the per-block attention + FFN; the front-end (`img_in`/`txt_in.linear_{1,2}`/
+    /// `time_embed.linear_{1,2}`/`time_mod_proj`/`final_layer.linear`) leaves are added on top by the
+    /// [`crate::adapters::AdditiveDit`] impl below (sc-11720 wide surface; `time_mod_proj` added sc-14163),
+    /// so they are NOT visited here. `text_fusion.projector` stays out of surface.
+    pub fn visit_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        let TransformerBlocks::Resident(blocks) = &mut self.blocks else {
+            return Err(candle_gen::CandleError::Msg(
+                "Krea streamed blocks cannot install job-local adapters; apply adapters before \
+                 selecting block streaming"
+                    .into(),
+            ));
+        };
+        for (i, blk) in blocks.iter_mut().enumerate() {
+            blk.visit_adaptable_mut(&format!("transformer_blocks.{i}"), f)?;
+        }
+        self.text_fusion.visit_adaptable_mut(f)?;
+        Ok(())
+    }
+
+    /// Drop **every** forward-time additive LoRA/LoKr residual from every adaptable projection, reverting
+    /// the DiT to its bare base — the per-phase adapter toggle-off a multi-phase render (epic 13879,
+    /// sc-13887) runs on its **job-local** DiT between phases. It clears exactly the surface
+    /// [`crate::adapters::install_additive`] pushes onto (the [`AdditiveDit`](crate::adapters::AdditiveDit)
+    /// surface): the per-block attention + SwiGLU projections plus the `text_fusion` blocks (via the inner
+    /// [`Self::visit_adaptable_mut`]) AND the front-end + final leaves (`img_in` / `time_embed.linear_1/2`
+    /// / `time_mod_proj` / `txt_in.linear_1/2` / `final_layer.linear`, including ConvRot residual hosts).
+    /// After clearing,
+    /// the forward is byte-identical to the un-adapted base; a subsequent `install_additive` of the next
+    /// phase's subset makes that phase's adapter set authoritative regardless of what the prior phase (or
+    /// the load-time bake) installed. The base weight tensors are never touched, so this is a cheap, exact
+    /// toggle that a concurrency-safe multi-phase driver runs only on a job-local DiT — never the shared
+    /// resident. The candle twin of mlx-gen-krea's `Krea2Transformer::clear_adapters`.
+    pub fn clear_adapters(&mut self) -> candle_gen::Result<()> {
+        self.visit_adaptable_mut(&mut |_, projection| {
+            projection.clear_adapters();
+            Ok(())
+        })?;
+        for proj in [
+            &mut self.img_in,
+            &mut self.time_embed_l1,
+            &mut self.time_embed_l2,
+            &mut self.time_mod_proj,
+            &mut self.txt_in_l1,
+            &mut self.txt_in_l2,
+            &mut self.final_linear,
+        ] {
+            if let Some(projection) = proj.as_additive_mut() {
+                projection.clear_adapters();
+            }
+        }
+        Ok(())
+    }
+
+    /// Build (or reuse) the joint RoPE `(cos, sin)` table for this render's fixed geometry (sc-8992).
+    /// Recomputed only when `(cap_len, ht, wt, n_refs)` changes; otherwise the Arc-backed handles are
+    /// cloned. `n_refs == 0` builds the plain t2i `[text, image]` table (byte-identical to building it
+    /// inline); `n_refs > 0` builds the edit `[text, refs…, target]` table (sc-10877). Since
+    /// `build_edit(n_refs = 0) ≡ build_t2i`, the t2i call stays on the exact `build_t2i` path.
+    fn rope_tables(
+        &self,
+        cap_len: usize,
+        ht: usize,
+        wt: usize,
+        n_refs: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        self.rope_cache.get_or_build((cap_len, ht, wt, n_refs), || {
+            let (axes, theta) = (self.cfg.axes_dims_rope, self.cfg.rope_theta as f64);
+            let rope = if n_refs == 0 {
+                RopeTables::build_t2i(cap_len, ht, wt, axes, theta, &self.device)?
+            } else {
+                RopeTables::build_edit(cap_len, ht, wt, n_refs, axes, theta, &self.device)?
+            };
+            Ok(rope.joint())
+        })
+    }
+
+    /// Patch-embed a normalized `[b, 16, H, W]` latent through the (adapter-carrying) `img_in` →
+    /// `[b, img_len, hidden]`. Shared by the target-latent embed and the edit reference-latent embeds
+    /// (sc-10877) so every image token — noise or reference — goes through the identical projection.
+    fn embed_image(&self, latent: &Tensor) -> Result<Tensor> {
+        self.img_in.forward(&patchify(
+            &latent.to_dtype(self.dtype)?,
+            self.cfg.patch_size,
+        )?)
+    }
+
+    /// The shared timestep + text front-end (sc-10877): the sinusoidal timestep embed `t`, the shared
+    /// modulation `tvec = time_mod_proj(GELU(t))`, and the projected text context `ctx`
+    /// `[b, cap, hidden]`. Both [`forward`](Self::forward) (t2i) and [`forward_edit`](Self::forward_edit)
+    /// call this, so the t2i front-end stays byte-identical.
+    fn front_end(&self, timestep: &Tensor, context: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let cfg = &self.cfg;
+        let dt = self.dtype;
+        let context = context.to_dtype(dt)?;
+
+        // Timestep embed → `t`; shared modulation `tvec = time_mod_proj(GELU(t))`.
+        let t_sin = temb(timestep, cfg.timestep_embed_dim, &self.device)?.to_dtype(dt)?; // [b, 1, tdim]
+        let t = self
+            .time_embed_l2
+            .forward(&self.time_embed_l1.forward(&t_sin)?.gelu()?)?; // [b, 1, hidden]
+        let tvec = self.time_mod_proj.forward(&t.gelu()?)?; // [b, 1, 6·hidden]
+
+        // Text fusion (12 layers → 1) then the text input projection.
+        let ctx = self.text_fusion.forward(&context)?; // [b, cap, text_hidden]
+        let ctx = self.txt_in_norm.forward(&ctx)?;
+        let ctx = self
+            .txt_in_l2
+            .forward(&self.txt_in_l1.forward(&ctx)?.gelu()?)?; // [b, cap, hidden]
+        Ok((t, tvec, ctx))
+    }
+
+    /// Velocity prediction.
+    ///
+    /// - `latent`: `[b, 16, H, W]` (H, W multiples of `patch_size`),
+    /// - `timestep`: `[b]` f32 (raw flow time in `[0, 1]`),
+    /// - `context`: `[b, n_tokens, num_text_layers, text_hidden]` — the stacked Qwen3-VL select-layer
+    ///   hidden states (sc-7569), already trimmed to the valid token count (no padding).
+    ///
+    /// Returns the velocity `[b, 16, H, W]`.
+    pub fn forward(&self, latent: &Tensor, timestep: &Tensor, context: &Tensor) -> Result<Tensor> {
+        self.forward_with_memory(
+            latent,
+            timestep,
+            context,
+            candle_gen::ATTN_SCORES_BUDGET,
+            DEFAULT_TRANSFORMER_WINDOW,
+            &candle_gen::gen_core::CancelFlag::default(),
+        )
+        .map_err(|error| match error {
+            candle_gen::CandleError::Candle(error) => error,
+            other => candle_gen::candle_core::Error::Msg(other.to_string()),
+        })
+    }
+
+    /// [`Self::forward`] with the constrained-card attention budget, the rung-4 block window, and
+    /// cancellation threaded through the block loop.
+    ///
+    /// On a streamed trunk the window's blocks are the only block weights resident on the accelerator
+    /// at once — the schedule, the release discipline and the typed cancellation all come from
+    /// [`candle_gen::block_window::run_windowed`] rather than being re-derived here. `transformer_window`
+    /// is the number of consecutive blocks held materialized; see [`DEFAULT_TRANSFORMER_WINDOW`] for
+    /// why the shipped value is 1 and why it is still a parameter. It is ignored by the resident arm.
+    pub fn forward_with_memory(
+        &self,
+        latent: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        attention_scores_budget: usize,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Tensor> {
+        let cfg = &self.cfg;
+        let p = cfg.patch_size;
+        let (_, _, h, w) = latent.dims4()?;
+        let (ht, wt) = (h / p, w / p);
+        let img_len = ht * wt;
+        let latent_ch = cfg.in_channels / (p * p);
+        let cap_len = context.dim(1)?;
+        let attention_plan = request_attention_plan(attention_scores_budget, cancel);
+
+        // Image patch embed + shared timestep/text front-end.
+        let img = self.embed_image(latent)?; // [b, img_len, hidden]
+        let (t, tvec, ctx) = self.front_end(timestep, context)?;
+
+        // Fuse to the joint sequence and run the single-stream stack under the joint RoPE.
+        let mut combined = Tensor::cat(&[&ctx, &img], 1)?; // [b, cap+img_len, hidden]
+
+        // The joint RoPE table is step-invariant (fixed geometry), so cache it per render (sc-8992).
+        let (rcos, rsin) = self.rope_tables(cap_len, ht, wt, 0)?;
+        match &self.blocks {
+            TransformerBlocks::Resident(blocks) => {
+                for blk in blocks {
+                    candle_gen::check_cancel(cancel)?;
+                    combined = blk.forward_with_attention_plan(
+                        &combined,
+                        &tvec,
+                        &rcos,
+                        &rsin,
+                        attention_plan,
+                    )?;
+                }
+            }
+            TransformerBlocks::Streamed(weights) => {
+                let cfg = &self.cfg;
+                let dit_plan = DitPlan::baseline().with_num_layers(cfg.num_layers);
+                let block_plan = BlockPlan::new(cfg.num_layers, transformer_window)?;
+                combined = candle_gen::block_window::run_windowed(
+                    &self.device,
+                    &block_plan,
+                    cancel,
+                    combined,
+                    // The view is the retained read-only mmap. It caches no tensors — every `get`
+                    // reads the mapping and produces a new device tensor — so an `Arc` clone IS a
+                    // fresh view, and re-`mmap`ing per window would buy a guarantee the type already
+                    // gives. See `candle_gen::block_window`'s module docs for why Candle discharges
+                    // MLX's freshness obligation structurally instead of by re-opening.
+                    || Ok(std::sync::Arc::clone(weights)),
+                    |mut state, view, range| {
+                        let blocks = materialize_window(view, cfg, &dit_plan, range)?;
+                        for block in &blocks {
+                            // Finer than the driver's per-window gate, deliberately (sc-16003): one
+                            // block is ~2 s at 2048², and a cancel unread until the window ends is
+                            // grace the worker's bounded wind-down does not have. At the shipped
+                            // window of 1 the two coincide; this keeps that true if it ever widens.
+                            candle_gen::check_cancel(cancel)?;
+                            state = block.forward_with_attention_plan(
+                                &state,
+                                &tvec,
+                                &rcos,
+                                &rsin,
+                                attention_plan,
+                            )?;
+                        }
+                        Ok(state)
+                    },
+                )?;
+            }
+        }
+
+        // Continuous-AdaLN output (SimpleModulation on `t`), then slice the image tokens + unpatchify.
+        let out = self.final_layer(&combined, &t)?; // [b, cap+img_len, in_channels]
+        let img_out = out.narrow(1, cap_len, img_len)?;
+        Ok(unpatchify(&img_out, ht, wt, p, latent_ch)?)
+    }
+
+    /// **Kontext-style edit velocity prediction** (epic 10871 / sc-10877). Identical to
+    /// [`forward`](Self::forward) but with one or more in-context reference latents prepended between the
+    /// text and the noise: the joint sequence is `[text, refs…, target]`, each reference embedded through
+    /// the same frozen `img_in` and positioned at its own RoPE frame ([`RopeTables::build_edit`]). The
+    /// `in_channels` is unchanged (64) — this is **sequence** concat, not channel concat.
+    ///
+    /// - `latent`: the noise target `[b, 16, H, W]`.
+    /// - `refs`: the VAE-encoded reference latents, **each at the target resolution** `[b, 16, H, W]`
+    ///   (they share the target patch grid); fixed order (image 1, then image 2 — sc-10878). Empty ⇒
+    ///   byte-identical to [`forward`](Self::forward) (the rope table falls back to `build_t2i`).
+    /// - `context`: the (optionally image-grounded, P2) `[b, n_tokens, num_text_layers, text_hidden]`.
+    ///
+    /// Returns the velocity for the **target** tokens only `[b, 16, H, W]` (the reference tokens are
+    /// conditioning; their output slice is discarded).
+    pub fn forward_edit(
+        &self,
+        latent: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        refs: &[Tensor],
+    ) -> Result<Tensor> {
+        self.forward_edit_with_memory(
+            latent,
+            timestep,
+            context,
+            refs,
+            candle_gen::ATTN_SCORES_BUDGET,
+            &candle_gen::gen_core::CancelFlag::default(),
+        )
+        .map_err(|error| match error {
+            candle_gen::CandleError::Candle(error) => error,
+            other => candle_gen::candle_core::Error::Msg(other.to_string()),
+        })
+    }
+
+    /// [`Self::forward_edit`] with the constrained-card attention budget and cancellation threaded
+    /// through the block loop — the edit twin of [`Self::forward_with_memory`].
+    ///
+    /// The cancel checkpoint is what makes a **long** step interruptible (sc-16003). The sampler's
+    /// between-steps poll reads the flag once per step, immediately before calling the model, which is
+    /// useless when one step runs for minutes: an edit's joint sequence is `cap_len + (n_refs + 1) ·
+    /// img_len`, so a 2048² edit runs ~37k tokens and ~45 s per step. With no checkpoint inside the
+    /// forward the consumer trips the flag, nothing reads it until the step ends, and the worker's
+    /// bounded wind-down exhausts its grace and abandons the join — `abort()` is inert on a
+    /// `spawn_blocking` task, so the GPU work keeps running unattributed while the UI shows
+    /// "Cancelling…". Per block bounds that to one block (~2 s at 2048²).
+    pub fn forward_edit_with_memory(
+        &self,
+        latent: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        refs: &[Tensor],
+        attention_scores_budget: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Tensor> {
+        let cfg = &self.cfg;
+        let p = cfg.patch_size;
+        let (_, _, h, w) = latent.dims4()?;
+        let (ht, wt) = (h / p, w / p);
+        let img_len = ht * wt;
+        let latent_ch = cfg.in_channels / (p * p);
+        let n_refs = refs.len();
+        let cap_len = context.dim(1)?;
+        let attention_plan = request_attention_plan(attention_scores_budget, cancel);
+
+        // Target + reference image tokens (references must share the target grid — VAE-encoded at the
+        // target resolution). All go through the identical `img_in` projection.
+        let img = self.embed_image(latent)?;
+        let mut ref_toks = Vec::with_capacity(n_refs);
+        for (i, r) in refs.iter().enumerate() {
+            let (_, _, rh, rw) = r.dims4()?;
+            if rh != h || rw != w {
+                return Err(candle_gen::CandleError::Msg(format!(
+                    "krea edit: reference {i} is {rh}x{rw} but the target latent is {h}x{w}; \
+                     references must be VAE-encoded at the target resolution"
+                )));
+            }
+            ref_toks.push(self.embed_image(r)?);
+        }
+
+        let (t, tvec, ctx) = self.front_end(timestep, context)?;
+
+        // Joint sequence `[ctx, refs…, target]` (references BEFORE the noise — the Krea2Edit contract).
+        let mut parts: Vec<&Tensor> = Vec::with_capacity(2 + n_refs);
+        parts.push(&ctx);
+        parts.extend(ref_toks.iter());
+        parts.push(&img);
+        let mut combined = Tensor::cat(&parts, 1)?;
+
+        let (rcos, rsin) = self.rope_tables(cap_len, ht, wt, n_refs)?;
+        let TransformerBlocks::Resident(blocks) = &self.blocks else {
+            return Err(candle_gen::CandleError::Msg(
+                "Krea block streaming is supported only for ordinary text-to-image denoise".into(),
+            ));
+        };
+        combined = fold_block_sequence(blocks.len(), cancel, combined, |i, combined| {
+            blocks[i].forward_with_attention_plan(&combined, &tvec, &rcos, &rsin, attention_plan)
+        })?;
+
+        // Slice the TARGET tokens (they sit last, after the text + all reference blocks) + unpatchify.
+        let out = self.final_layer(&combined, &t)?;
+        let target_offset = cap_len + n_refs * img_len;
+        let img_out = out.narrow(1, target_offset, img_len)?;
+        Ok(unpatchify(&img_out, ht, wt, p, latent_ch)?)
+    }
+
+    /// Reference `LastLayer`: `SimpleModulation(t) = t + scale_shift_table` → `(scale, shift)`;
+    /// `Linear((1+scale)·RMSNorm(x) + shift)`.
+    fn final_layer(&self, x: &Tensor, t: &Tensor) -> Result<Tensor> {
+        let m = t.broadcast_add(&self.final_sstable)?; // [b, 2, hidden] (t broadcasts 1→2)
+        let scale = m.narrow(1, 0, 1)?; // [b, 1, hidden]
+        let shift = m.narrow(1, 1, 1)?;
+        let normed = self
+            .final_norm
+            .forward(x)?
+            .broadcast_mul(&(scale + 1.0)?)?
+            .broadcast_add(&shift)?;
+        self.final_linear.forward(&normed)
+    }
+}
+
+impl crate::adapters::AdditiveDit for Krea2Transformer {
+    /// The txt2img adapter surface: per-block attention + SwiGLU FFN (via the inner
+    /// [`Self::visit_adaptable_mut`]) PLUS the front-end + final leaves (sc-11720 wide surface). The
+    /// Every shipping dense, MLX-packed, and INT8-ConvRot `QLinear` is residual-capable; bench-only
+    /// NVFP4/probed projections are never selected by the registered generator route.
+    fn visit_additive(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut dyn crate::adapters::AdditiveProj) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        self.visit_adaptable_mut(&mut |path, a| f(path, a))?;
+        for (path, proj) in [
+            ("img_in", &mut self.img_in),
+            ("time_embed.linear_1", &mut self.time_embed_l1),
+            ("time_embed.linear_2", &mut self.time_embed_l2),
+            ("time_mod_proj", &mut self.time_mod_proj),
+            ("txt_in.linear_1", &mut self.txt_in_l1),
+            ("txt_in.linear_2", &mut self.txt_in_l2),
+            ("final_layer.linear", &mut self.final_linear),
+        ] {
+            if let Some(projection) = proj.as_additive_mut() {
+                f(path, projection)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn adapter_device(&self) -> Device {
+        self.device.clone()
+    }
+
+    fn adapter_surface_hint(&self) -> &'static str {
+        "expected bare/PEFT `<path>.lora_A/B.weight` (LoRA) or `<module>.lokr_w1/w2` (LoKr) over the DiT \
+         attention (to_q|to_k|to_v|to_gate|to_out.0) + SwiGLU FFN (ff.gate|ff.up|ff.down) across the \
+         single-stream transformer_blocks and text_fusion blocks, plus the front-end \
+         (img_in|time_embed.linear_1/2|time_mod_proj|txt_in.linear_1/2|final_layer.linear) projections; \
+         or a ComfyUI/\
+         lightx2v `<module>.diff`/`.diff_b` diff-patch (full-weight/bias delta, incl. the \
+         text_fusion.projector 12→1 collapse). Conv-layer / text-encoder adapters are out of surface"
+    }
+}
+
+/// Reference `temb`: `freqs = exp(−ln(1e4)·arange(half)/half)`, `args = (timestep·1e3)·freqs`,
+/// `concat([cos, sin], −1)` (cos-first). `timestep`: `[b]` → `[b, 1, dim]` (a per-sample vector that
+/// broadcasts over the sequence). Built in f32 (the reference upcasts).
+///
+/// `pub(crate)` so the trainable DiT ([`crate::train_dit`]) shares the exact embedding (parity).
+pub(crate) fn temb(timestep: &Tensor, dim: usize, device: &Device) -> Result<Tensor> {
+    let half = dim / 2;
+    let neg_ln = -(10000f64.ln()) as f32;
+    let freqs: Vec<f32> = (0..half)
+        .map(|i| (neg_ln * i as f32 / half as f32).exp())
+        .collect();
+    let freqs = Tensor::from_vec(freqs, (1, half), device)?; // [1, half]
+    let b = timestep.dim(0)?;
+    let scaled = (timestep.to_dtype(DType::F32)?.reshape((b, 1, 1))? * 1000.0)?; // [b, 1, 1]
+    let args = scaled.broadcast_mul(&freqs.reshape((1, 1, half))?)?; // [b, 1, half]
+    Tensor::cat(&[args.cos()?, args.sin()?], D::Minus1) // [b, 1, dim]
+}
+
+/// Reference `rearrange("b c (h ph) (w pw) -> b (h w) (c ph pw)")`: `[b, C, H, W] →
+/// [b, (H/p)(W/p), C·p·p]` with **channel-major** patch flattening (NOT boogu's `(ph pw c)`).
+///
+/// `pub(crate)` so the trainable DiT ([`crate::train_dit`]) patchifies identically.
+pub(crate) fn patchify(latent: &Tensor, p: usize) -> Result<Tensor> {
+    let (b, c, h, w) = latent.dims4()?;
+    let (ht, wt) = (h / p, w / p);
+    let x = latent.reshape((b, c, ht, p, wt, p))?; // b, c, ht, ph, wt, pw
+    let x = x.permute((0, 2, 4, 1, 3, 5))?; // b, ht, wt, c, ph, pw
+    x.contiguous()?.reshape((b, ht * wt, c * p * p))
+}
+
+/// Inverse of [`patchify`] (`"b (h w) (c ph pw) -> b c (h ph) (w pw)"`): `[b, (h)(w), C·p·p] →
+/// [b, C, h·p, w·p]`.
+///
+/// `pub(crate)` so the trainable DiT ([`crate::train_dit`]) unpatchifies identically.
+pub(crate) fn unpatchify(
+    tokens: &Tensor,
+    ht: usize,
+    wt: usize,
+    p: usize,
+    c: usize,
+) -> Result<Tensor> {
+    let b = tokens.dim(0)?;
+    let x = tokens.contiguous()?.reshape((b, ht, wt, c, p, p))?; // b, ht, wt, c, ph, pw
+    let x = x.permute((0, 3, 1, 4, 2, 5))?; // b, c, ht, ph, wt, pw
+    x.contiguous()?.reshape((b, c, ht * p, wt * p))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_gen::candle_core::Device;
+
+    /// The resident/edit trunk's per-block cancel checkpoint. (The streamed trunk moved onto
+    /// `candle_gen::block_window::run_windowed` in SC-15792 and no longer uses this helper; its
+    /// cancellation is covered by `streamed_cancel_is_typed_and_stops_inside_the_trunk` below.)
+    #[test]
+    fn resident_block_fold_stops_before_loading_the_next_block_after_cancel() {
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        let cancel_from_block = cancel.clone();
+        let mut visited = Vec::new();
+        let error = fold_block_sequence(4, &cancel, 0usize, |index, count| {
+            visited.push(index);
+            if index == 0 {
+                cancel_from_block.cancel();
+            }
+            Ok(count + 1)
+        })
+        .unwrap_err();
+        assert!(matches!(error, candle_gen::CandleError::Canceled));
+        assert_eq!(visited, vec![0]);
+    }
+
+    /// Fixture-driven `(resident, streamed, cfg, latent, timestep, context)` for the rung-4 tests.
+    /// Six blocks so window 4 leaves a ragged 2-block tail.
+    #[allow(clippy::type_complexity)]
+    fn streamed_pair(
+        tmp: &tempfile::TempDir,
+    ) -> (Krea2Transformer, Krea2Transformer, Tensor, Tensor, Tensor) {
+        let (resident, streamed, cfg) = crate::testfix::tiny_transformer_streamed_pair(tmp, 6);
+        let latent_ch = cfg.in_channels / (cfg.patch_size * cfg.patch_size);
+        let latent = crate::testfix::rnd(&[1, latent_ch, 4, 4]);
+        let timestep = Tensor::from_vec(vec![0.3f32], 1, &Device::Cpu).unwrap();
+        let context = crate::testfix::rnd(&[1, 3, cfg.num_text_layers, cfg.text_hidden_dim]);
+        (resident, streamed, latent, timestep, context)
+    }
+
+    /// **SC-15792's parity criterion.** The windowed trunk must produce the resident trunk's output
+    /// exactly — not to a tolerance — at every window size including one with a ragged tail.
+    ///
+    /// Exactness is available and therefore required: rung 4 re-orders *when* weights are read, never
+    /// what arithmetic runs on them, so any deviation is a defect rather than accumulated error. The
+    /// ragged case (window 4 over 6 blocks) is the arm that catches a driver whose last window is
+    /// mis-clamped — it would silently skip layers and still return a plausible tensor.
+    #[test]
+    fn streamed_trunk_is_bit_identical_to_the_resident_trunk_at_every_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (resident, streamed, latent, timestep, context) = streamed_pair(&tmp);
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+
+        let want = resident
+            .forward_with_memory(
+                &latent,
+                &timestep,
+                &context,
+                candle_gen::ATTN_SCORES_BUDGET,
+                DEFAULT_TRANSFORMER_WINDOW,
+                &cancel,
+            )
+            .expect("the resident trunk renders");
+
+        for window in [1usize, 2, 3, 4, 6, 99] {
+            let got = streamed
+                .forward_with_memory(
+                    &latent,
+                    &timestep,
+                    &context,
+                    candle_gen::ATTN_SCORES_BUDGET,
+                    window,
+                    &cancel,
+                )
+                .unwrap_or_else(|e| panic!("streamed trunk at window {window}: {e:?}"));
+
+            assert_eq!(got.dims(), want.dims(), "window {window}: shape");
+            let max_delta = (&got - &want)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_vec0::<f32>()
+                .unwrap();
+            assert_eq!(
+                max_delta, 0.0,
+                "window {window}: streaming must not change the math (max |delta| {max_delta})"
+            );
+        }
+    }
+
+    /// The parity assertion above is only worth its green if it can go red. A window that silently
+    /// dropped its ragged tail — the exact failure `BlockPlan`'s clamping prevents — must produce a
+    /// DIFFERENT tensor, or `streamed_trunk_is_bit_identical_to_the_resident_trunk_at_every_window`
+    /// would pass with the last blocks never running.
+    ///
+    /// Stated as a property of the fixture rather than by mutating the driver: running the trunk
+    /// truncated to 4 of its 6 blocks must not coincidentally equal the full trunk.
+    #[test]
+    fn a_trunk_that_skipped_its_tail_would_not_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (resident, _streamed, latent, timestep, context) = streamed_pair(&tmp);
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        let full = resident
+            .forward_with_memory(
+                &latent,
+                &timestep,
+                &context,
+                candle_gen::ATTN_SCORES_BUDGET,
+                DEFAULT_TRANSFORMER_WINDOW,
+                &cancel,
+            )
+            .unwrap();
+
+        // A 4-block trunk over the same weights = "window 4 dropped the ragged tail".
+        let (truncated, _, _) = crate::testfix::tiny_transformer_streamed_pair(&tmp, 4);
+        let short = truncated
+            .forward_with_memory(
+                &latent,
+                &timestep,
+                &context,
+                candle_gen::ATTN_SCORES_BUDGET,
+                DEFAULT_TRANSFORMER_WINDOW,
+                &cancel,
+            )
+            .unwrap();
+
+        let delta = (&short - &full)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_vec0::<f32>()
+            .unwrap();
+        assert!(
+            delta > 0.0,
+            "the parity test would be vacuous: a trunk missing two blocks matched the full one"
+        );
+    }
+
+    /// A cancel tripped mid-trunk surfaces as the TYPED `Canceled` through the streamed driver, and
+    /// bridges to `gen_core::Error::Canceled`. A stringified `Msg` here would report a cancelled
+    /// render as a failed job (sc-4481) — the exact regression SC-15754 had to fix on the MLX twin,
+    /// and the path now crosses two `From` conversions either of which could flatten it.
+    #[test]
+    fn streamed_cancel_is_typed_and_stops_inside_the_trunk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_resident, streamed, latent, timestep, context) = streamed_pair(&tmp);
+
+        let cancelled = candle_gen::gen_core::CancelFlag::default();
+        cancelled.cancel();
+        let error = streamed
+            .forward_with_memory(
+                &latent,
+                &timestep,
+                &context,
+                candle_gen::ATTN_SCORES_BUDGET,
+                DEFAULT_TRANSFORMER_WINDOW,
+                &cancelled,
+            )
+            .expect_err("a tripped flag must abort the streamed trunk");
+
+        assert!(
+            matches!(error, candle_gen::CandleError::Canceled),
+            "expected the typed Canceled, got {error:?}"
+        );
+        assert!(matches!(
+            candle_gen::gen_core::Error::from(error),
+            candle_gen::gen_core::Error::Canceled
+        ));
+    }
+
+    /// A degenerate window is a typed error, not a hang. `BlockPlan::new` rejects 0, and the streamed
+    /// arm must surface that rather than looping forever on a zero-length step.
+    #[test]
+    fn a_zero_window_is_rejected_rather_than_looping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_resident, streamed, latent, timestep, context) = streamed_pair(&tmp);
+        let error = streamed
+            .forward_with_memory(
+                &latent,
+                &timestep,
+                &context,
+                candle_gen::ATTN_SCORES_BUDGET,
+                0,
+                &candle_gen::gen_core::CancelFlag::default(),
+            )
+            .expect_err("a zero window must be rejected");
+        assert!(
+            matches!(error, candle_gen::CandleError::Msg(ref m) if m.contains("window")),
+            "{error:?}"
+        );
+    }
+
+    /// **The CPU half of the rung's mutation check.** Every block in the window must be live at
+    /// once, because that — not the loop shape — is what makes peak `window x per-block bytes`.
+    ///
+    /// This exists because the failure mode is silent in the worst way: loading blocks one at a time
+    /// inside the forward loop produces identical output, raises no error, and executes a window of 1
+    /// whatever the selector asked for. Adversarial review of SC-15792 demonstrated it — inlining the
+    /// materialization left all 199 tests in this crate green — so a comment warning about it was not
+    /// coverage. The GPU twin (`defeating_the_release_restores_the_resident_peak`) measures the peak;
+    /// this one runs on every CI lane and needs no accelerator.
+    #[test]
+    fn a_window_materializes_every_block_before_any_of_them_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_resident, streamed, cfg) = crate::testfix::tiny_transformer_streamed_pair(&tmp, 6);
+        let dit_plan = DitPlan::baseline().with_num_layers(cfg.num_layers);
+        let TransformerBlocks::Streamed(weights) = &streamed.blocks else {
+            panic!("the fixture must produce a streamed trunk");
+        };
+
+        for window in [1usize, 2, 3, 4] {
+            let plan = BlockPlan::new(cfg.num_layers, window).unwrap();
+            for range in plan.windows() {
+                let want = range.len();
+                let blocks = materialize_window(weights, &cfg, &dit_plan, range.clone())
+                    .unwrap_or_else(|e| panic!("window {window}, blocks {range:?}: {e:?}"));
+                assert_eq!(
+                    blocks.len(),
+                    want,
+                    "window {window}, blocks {range:?}: {} blocks were materialized together, not \
+                     {want}. Peak is then `1 x per-block bytes` regardless of the selected window, \
+                     and the rung reports a bound it does not hold.",
+                    blocks.len()
+                );
+            }
+        }
+    }
+
+    /// **The configuration SC-15791 flagged as untested.** Its release-semantics arms all ran on one
+    /// device and one stream, where CUDA's stream-ordered allocator guarantees reuse ordering a
+    /// priori; it said so explicitly and refused to treat that as licence to relax sc-12195's
+    /// phase-boundary sync. The nearest untested shape is a window driver materializing from a worker
+    /// thread, so it is driven here rather than left as an assumption.
+    ///
+    /// CPU cannot reproduce a CUDA stream race — what this pins is that the driver is `Send`-safe and
+    /// order-preserving off the main thread, so the CUDA arm in
+    /// `rung4_block_window_real_weights.rs` has a compiled, exercised path to run.
+    #[test]
+    fn streamed_output_is_identical_when_driven_from_a_worker_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_resident, streamed, latent, timestep, context) = streamed_pair(&tmp);
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+
+        let run = |dit: &Krea2Transformer| {
+            dit.forward_with_memory(
+                &latent,
+                &timestep,
+                &context,
+                candle_gen::ATTN_SCORES_BUDGET,
+                DEFAULT_TRANSFORMER_WINDOW,
+                &cancel,
+            )
+        };
+
+        let on_main = run(&streamed).expect("main-thread render");
+        let on_worker = std::thread::scope(|s| s.spawn(|| run(&streamed)).join().unwrap())
+            .expect("worker-thread render");
+
+        let delta = (&on_worker - &on_main)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_vec0::<f32>()
+            .unwrap();
+        assert_eq!(
+            delta, 0.0,
+            "materializing windows from a worker thread must not change the output"
+        );
+    }
+
+    #[test]
+    fn patchify_roundtrips_channel_major() {
+        let dev = Device::Cpu;
+        // [1, 4, 4, 6] with p=2 → 2×3 grid, 4·2·2 = 16 packed channels.
+        let x = Tensor::arange(0f32, (4 * 4 * 6) as f32, &dev)
+            .unwrap()
+            .reshape((1, 4, 4, 6))
+            .unwrap();
+        let packed = patchify(&x, 2).unwrap();
+        assert_eq!(packed.dims(), &[1, 2 * 3, 4 * 2 * 2]);
+        let back = unpatchify(&packed, 2, 3, 2, 4).unwrap();
+        assert_eq!(back.dims(), x.dims());
+        let a = x.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = back.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(a, b, "patchify∘unpatchify must be the identity");
+    }
+
+    #[test]
+    fn temb_is_cos_first_and_scaled() {
+        let dev = Device::Cpu;
+        // t = 0 → all angles 0 → cos half = 1, sin half = 0.
+        let t = Tensor::from_vec(vec![0f32], (1,), &dev).unwrap();
+        let e = temb(&t, 8, &dev).unwrap();
+        assert_eq!(e.dims(), &[1, 1, 8]);
+        let v = e.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            v[..4].iter().all(|&x| (x - 1.0).abs() < 1e-6),
+            "cos-first half = 1 at t=0"
+        );
+        assert!(
+            v[4..].iter().all(|&x| x.abs() < 1e-6),
+            "sin half = 0 at t=0"
+        );
+    }
+
+    /// sc-14163 (candle parity, real-transformer coverage): the inference [`Krea2Transformer`]'s
+    /// additive-adapter surface — [`AdditiveDit::visit_additive`], the surface `install_additive` pushes
+    /// residuals onto and `clear_adapters` resets — must include ALL SEVEN front-end/global projections,
+    /// crucially `time_mod_proj`. Its native `tproj.1` turbo-LoRA target carries an essential low-rank
+    /// residual; MLX already routes it via `adaptable_mut`, and this PR added it to candle's surface.
+    /// Built on a REAL dense-tier DiT (not the string normalizer, not a hand-rolled `MockDit`): on a dense
+    /// tier every front-end `QLinear` yields an adapter-capable `AdaptLinear`, so all seven are visited.
+    /// **Discriminating:** a future edit that re-drops `time_mod_proj` from `visit_additive` fails here —
+    /// the exact false-green this test exists to prevent.
+    #[test]
+    fn additive_surface_includes_all_seven_global_projections() {
+        use crate::adapters::AdditiveDit;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut dit, _cfg) = crate::testfix::tiny_transformer(&tmp);
+
+        let mut visited: Vec<String> = Vec::new();
+        dit.visit_additive(&mut |p, _proj| {
+            visited.push(p.to_string());
+            Ok(())
+        })
+        .unwrap();
+
+        // All seven front-end/global projections must be on the surface. `time_mod_proj` is the leaf this
+        // PR added (sc-14163); dropping it again would fail this assertion.
+        for leaf in [
+            "img_in",
+            "time_embed.linear_1",
+            "time_embed.linear_2",
+            "time_mod_proj",
+            "txt_in.linear_1",
+            "txt_in.linear_2",
+            "final_layer.linear",
+        ] {
+            assert!(
+                visited.iter().any(|p| p == leaf),
+                "additive surface missing front-end leaf `{leaf}` — visited: {visited:?}"
+            );
+        }
+        // Sanity that the walk actually yielded the block targets too (so the front-end match is not a
+        // walk that produced nothing): one representative block-0 attention target suffices.
+        assert!(
+            visited
+                .iter()
+                .any(|p| p == "transformer_blocks.0.attn.to_q"),
+            "additive surface missing the block attention targets — visited: {visited:?}"
+        );
+    }
+
+    // sc-11201 / F-089: the RoPE cache must hold both true-CFG geometries at once so alternating
+    // cond/uncond forwards don't thrash it (rebuild every step). We exercise the bounded cache
+    // directly (it is model-independent) rather than standing up a full DiT.
+    #[test]
+    fn rope_cache_keeps_both_cfg_legs_resident() {
+        let cache: RopeCache<usize, i32> = RopeCache::new(ROPE_CACHE_CAP);
+        // Two alternating geometries stand in for the CFG cond (cap_len=77) and uncond (cap_len=12)
+        // token counts. `builds` counts how many times the (expensive) table build actually runs.
+        let mut builds = 0usize;
+        let (cond, uncond) = (77usize, 12usize);
+        for step in 0..52 {
+            for &cap in &[cond, uncond] {
+                let v = cache
+                    .get_or_build(cap, || {
+                        builds += 1;
+                        Ok(cap as i32 * 10)
+                    })
+                    .unwrap();
+                // Every hit returns exactly what a fresh build would (value keyed on geometry).
+                assert_eq!(v, cap as i32 * 10, "cached value must equal a fresh build");
+                let _ = step;
+            }
+        }
+        // 52 steps × 2 legs = 104 forwards, but only the first touch of each geometry builds:
+        // the single-entry cache would have rebuilt on all 104. This proves no thrash.
+        assert_eq!(
+            builds, 2,
+            "each CFG geometry built exactly once across all steps"
+        );
+    }
+
+    #[test]
+    fn rope_cache_evicts_oldest_beyond_capacity() {
+        // With more distinct geometries than capacity, the oldest is evicted (FIFO) and a re-touch
+        // rebuilds — but the two-geometry CFG case (cap ≥ 2) never reaches this.
+        let cache: RopeCache<usize, i32> = RopeCache::new(2);
+        let builds = std::cell::Cell::new(0usize);
+        let build = |k: usize| {
+            cache
+                .get_or_build(k, || {
+                    builds.set(builds.get() + 1);
+                    Ok(k as i32)
+                })
+                .unwrap()
+        };
+        build(1);
+        build(2);
+        assert_eq!(builds.get(), 2);
+        build(1); // still cached
+        assert_eq!(builds.get(), 2);
+        build(3); // evicts key 1 (oldest)
+        assert_eq!(builds.get(), 3);
+        build(1); // 1 was evicted → rebuild
+        assert_eq!(builds.get(), 4);
+    }
+
+    /// sc-16003: the **edit** forward must honor the request's cancel flag inside its block loop, and it
+    /// must be otherwise byte-identical to the plain wrapper.
+    ///
+    /// The sampler's between-steps poll is not enough on this path: an edit's joint sequence is
+    /// `cap_len + (n_refs + 1) · img_len`, so a 2048² edit step is ~45 s. A cancel tripped mid-step used
+    /// to go unread until the step ended — by which time the worker's bounded wind-down had exhausted its
+    /// grace and abandoned a `spawn_blocking` join `abort()` cannot stop, leaving live GPU work behind.
+    #[test]
+    fn edit_forward_honors_the_cancel_flag_per_block() {
+        use candle_gen::gen_core::CancelFlag;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, cfg) = crate::testfix::tiny_transformer(&tmp);
+        let latent_ch = cfg.in_channels / (cfg.patch_size * cfg.patch_size);
+        let latent = crate::testfix::rnd(&[1, latent_ch, 4, 4]);
+        let timestep = Tensor::from_vec(vec![0.7f32], 1, &Device::Cpu).unwrap();
+        let context = crate::testfix::rnd(&[1, 3, cfg.num_text_layers, cfg.text_hidden_dim]);
+        let refs = [crate::testfix::rnd(&[1, latent_ch, 4, 4])];
+        let run = |cancel: &CancelFlag| {
+            dit.forward_edit_with_memory(
+                &latent,
+                &timestep,
+                &context,
+                &refs,
+                candle_gen::ATTN_SCORES_BUDGET,
+                cancel,
+            )
+        };
+
+        // An untripped flag is inert: identical to the plain `forward_edit` wrapper, value for value.
+        let live = run(&CancelFlag::default()).expect("an untripped flag must not cancel");
+        let plain = dit
+            .forward_edit(&latent, &timestep, &context, &refs)
+            .expect("the plain wrapper still works");
+        assert_eq!(live.dims(), plain.dims(), "edit output shape");
+        let diff = (&live - &plain)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_vec0::<f32>()
+            .unwrap();
+        assert_eq!(
+            diff, 0.0,
+            "threading the cancel flag must not change the math"
+        );
+
+        // Tripped: the TYPED `Canceled`, which bridges to `gen_core::Error::Canceled` — the worker and
+        // the gen-core conformance suite key off it (sc-4481), so a stringified `Msg` would read as a
+        // backend failure and surface as "generation failed" instead of a clean cancel.
+        let cancelled = CancelFlag::default();
+        cancelled.cancel();
+        let error = run(&cancelled).expect_err("a tripped flag must abort the edit forward");
+        assert!(
+            matches!(error, candle_gen::CandleError::Canceled),
+            "expected the typed Canceled, got {error:?}"
+        );
+        assert!(matches!(
+            candle_gen::gen_core::Error::from(error),
+            candle_gen::gen_core::Error::Canceled
+        ));
+    }
+}

@@ -1,0 +1,188 @@
+//! The 8-step **distill LoRA** merge for the `sensenova_u1_8b_fast` variant — the candle port of
+//! `mlx-gen-sensenova`'s `distill.rs`.
+//!
+//! The reference ships an 8-NFE preview as a LoRA over the base checkpoint
+//! (`sensenova/SenseNova-U1-8B-MoT-LoRAs` → `SenseNova-U1-8B-MoT-LoRA-8step-V1.0.safetensors`) that
+//! is merged at load and then run at `cfg_scale=1.0` / `timestep_shift=3.0` / `num_steps=8`. The
+//! merge is: for every base parameter `…W.weight` with a matching `…W.lora_down.weight` /
+//! `…W.lora_up.weight` / `…W.alpha`, add `Δ = (alpha/rank)·(up @ down)` into the weight (`W += Δ`,
+//! computed in f32 — the components already load f32 here).
+//!
+//! The distill LoRA touches **only** the generation path — every layer's `*_mot_gen` attention
+//! projections (`{q,k,v,o}_proj_mot_gen`) and SwiGLU (`mlp_mot_gen.{gate,up,down}_proj`), plus the
+//! two FM-head Linears (`fm_modules.fm_head.{0,2}`) — `7·layers + 2` targets.
+
+use std::path::{Path, PathBuf};
+
+use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::candle_nn::{Linear, VarBuilder};
+use candle_gen::gen_core::WeightsSource;
+use candle_gen::quant::{DenseLinear, QLinear};
+use candle_gen::{CandleError, Result};
+
+/// Marker file dropped into a **pre-merged** `sensenova_u1_8b_fast` turnkey tier (sc-8775): its
+/// presence tells [`crate::load_fast`] the 8-step distill LoRA is already baked into the on-disk
+/// weights, so the loader must NOT resolve or merge it again. Absent ⇒ the legacy path (a dense base
+/// snapshot + the distill LoRA merged at load). The JSON body is provenance only; the loader keys off
+/// existence. Mirrors `mlx-gen-sensenova`'s `DISTILL_MERGED_MARKER`.
+pub const DISTILL_MERGED_MARKER: &str = "distill_merged.json";
+
+/// The distill LoRA file name (the `--include` argument the reference docs download).
+pub const DISTILL_LORA_FILE: &str = "SenseNova-U1-8B-MoT-LoRA-8step-V1.0.safetensors";
+/// The HF Hub repo the distill LoRA ships in (for the not-found error hint).
+pub const DISTILL_LORA_REPO: &str = "sensenova/SenseNova-U1-8B-MoT-LoRAs";
+
+/// A loaded distill-LoRA weight map (f32 mmap), keyed by the PEFT/diffusers `…lora_down`/`lora_up`/
+/// `alpha` layout.
+pub struct DistillLora {
+    vb: VarBuilder<'static>,
+}
+
+impl DistillLora {
+    /// mmap the LoRA `.safetensors` at f32 **on CPU**, and compute the merge delta on CPU.
+    ///
+    /// The LoRA's `alpha` is an I32 scalar (and the factors are bf16/f16), so reading them through an
+    /// F32 VarBuilder casts dtypes. The candle CUDA build on Blackwell (sm_120) is missing the
+    /// I32→F32 cast kernel — loading the alpha on-device fails with `CUDA_ERROR_NOT_FOUND` ("named
+    /// symbol not found"). CPU has every cast; [`DistillLora::merge_linear`] moves the resulting F32
+    /// delta to the base weight's device before adding.
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let vb = candle_gen::mmap_var_builder(&[path.to_path_buf()], DType::F32, &Device::Cpu)?;
+        Ok(Self { vb })
+    }
+
+    /// The `[out, in]` merge delta for `target` (the base weight key **without** its `.weight`
+    /// suffix, e.g. `…self_attn.q_proj_mot_gen`), or `None` if the LoRA does not carry that target.
+    ///
+    /// `Δ = (alpha/rank)·(up @ down)`, where `down` is `[rank, in]`, `up` is `[out, rank]`, and
+    /// `rank = down.shape[0]`.
+    pub fn delta(&self, target: &str) -> Result<Option<Tensor>> {
+        let down_key = format!("{target}.lora_down.weight");
+        if !self.vb.contains_tensor(&down_key) {
+            return Ok(None);
+        }
+        let down = self.vb.get_unchecked(&down_key)?; // [rank, in]
+        let up = self.vb.get_unchecked(&format!("{target}.lora_up.weight"))?; // [out, rank]
+        let alpha = scalar_f32(&self.vb.get_unchecked(&format!("{target}.alpha"))?)?;
+        let rank = down.dim(0)? as f32;
+        if rank == 0.0 {
+            // Zero rank (empty/malformed down factor) → non-finite scaling → NaN-poisoned GEN-path
+            // merge that silently corrupts every generation. Reject instead (F-002).
+            return Err(CandleError::Msg(format!(
+                "distill LoRA: zero-rank factor at '{target}'"
+            )));
+        }
+        let scaling = (alpha / rank) as f64;
+        let delta = (up.matmul(&down)? * scaling)?; // [out, in]
+        Ok(Some(delta))
+    }
+
+    /// Merge this LoRA's delta for `target` into `lin`, returning the merged projection, or `None`
+    /// if the LoRA carries no such target. `W += Δ`; the bias is untouched.
+    ///
+    /// **Dense only, deliberately (sc-14249).** A packed q4/q8 projection has no dense `W` to add
+    /// into — folding one would mean dequantize → add → re-quantize, i.e. materializing the very
+    /// dense 32 GB weight the packed tier exists to avoid, and re-rounding every row. It is also
+    /// unreachable: the shipped `*-fast-mlx` **packed** tiers all carry the
+    /// [`DISTILL_MERGED_MARKER`], so [`crate::load_fast`] skips resolve+merge entirely and the merge
+    /// only ever runs on a legacy dense base snapshot. This errors loudly rather than silently
+    /// dropping the 8-step distill (which would render the fast id at base-model step counts —
+    /// wrong, and invisible), so a future packed fast tier shipped WITHOUT the marker is caught at
+    /// load with an actionable message instead of degrading a render.
+    ///
+    /// The delta is computed and widened on CPU, then moved to the base weight's device and cast to
+    /// its store dtype — so a bf16-stored projection merges into bf16 (matching the merged tier the
+    /// packer produces) rather than silently promoting the whole weight to f32.
+    pub fn merge_linear(&self, lin: &QLinear, target: &str) -> Result<Option<QLinear>> {
+        let QLinear::Dense(DenseLinear::Linear(dense)) = lin else {
+            // Only reject once we know this LoRA actually carries the target — a packed tier that
+            // the LoRA does not touch is simply `None`, exactly as a dense one would be.
+            if self.delta(target)?.is_none() {
+                return Ok(None);
+            }
+            return Err(CandleError::Msg(format!(
+                "sensenova: cannot merge the 8-step distill LoRA into the PACKED projection \
+                 '{target}' — a packed q4/q8 tier must ship pre-merged (drop a \
+                 `{DISTILL_MERGED_MARKER}` marker in the tier dir, as the shipped *-fast-mlx tiers \
+                 do). Refusing rather than dropping the distill silently."
+            )));
+        };
+        Ok(self
+            .merge_dense(dense, target)?
+            .map(|m| QLinear::from_dense(DenseLinear::Linear(m))))
+    }
+
+    /// [`Self::merge_linear`] for a plain dense [`Linear`] — the FM head, which the tier packer
+    /// leaves dense in every tier so it never needs the packed arm.
+    ///
+    /// The delta is computed and widened on CPU, then moved to the base weight's device and cast to
+    /// its store dtype, so a bf16-stored projection merges into bf16 (matching the merged tier the
+    /// packer produces) rather than silently promoting the whole weight to f32.
+    pub fn merge_dense(&self, lin: &Linear, target: &str) -> Result<Option<Linear>> {
+        match self.delta(target)? {
+            Some(delta) => {
+                let w = lin.weight();
+                let delta = delta.to_device(w.device())?.to_dtype(w.dtype())?;
+                let merged = (w + delta)?;
+                Ok(Some(Linear::new(merged, lin.bias().cloned())))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+/// Read a (possibly I32) scalar LoRA `alpha` as `f32`. The distill LoRA stores `alpha` as an `I32`
+/// scalar; the f32 VarBuilder already converts it, but it may be rank-0 or `[1]` — flatten and take
+/// the first element.
+fn scalar_f32(a: &Tensor) -> Result<f32> {
+    a.to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?
+        .first()
+        .copied()
+        .ok_or_else(|| CandleError::Msg("distill LoRA: empty alpha scalar".into()))
+}
+
+/// Resolve the distill LoRA `.safetensors` for the `fast` variant from caller-supplied paths only
+/// (epic 13657, sc-13664 — no env side-channel, no HF-cache scan). Resolution order:
+/// 1. the `distill_lora` [`LoadSpec::components`](candle_gen::gen_core::LoadSpec::components) entry
+///    (`component`), when the caller staged one — a single `.safetensors` [`WeightsSource::File`];
+/// 2. otherwise co-located in the base snapshot `root` (`<root>/{DISTILL_LORA_FILE}`) — a passed-in
+///    snapshot asset.
+///
+/// Both are paths the caller provisioned; nothing is derived from an env side-channel or the on-disk
+/// HF cache. Errors (naming the `distill_lora` component) if neither resolves — the fast variant never
+/// silently falls back to the un-merged base. `component` is `spec.components.get("distill_lora")`;
+/// pass `None` for the offline converter (co-located only).
+pub fn resolve_distill_lora(component: Option<&WeightsSource>, root: &Path) -> Result<PathBuf> {
+    if let Some(src) = component {
+        let p = match src {
+            WeightsSource::File(p) => p.clone(),
+            WeightsSource::Dir(p) => {
+                return Err(CandleError::Msg(format!(
+                    "sensenova_u1_8b_fast: the 'distill_lora' component must be the \
+                     {DISTILL_LORA_FILE} .safetensors file, not a directory: {}",
+                    p.display()
+                )))
+            }
+        };
+        if !p.exists() {
+            return Err(CandleError::Msg(format!(
+                "sensenova_u1_8b_fast: the 'distill_lora' component path does not exist: {}",
+                p.display()
+            )));
+        }
+        return Ok(p);
+    }
+    let co_located = root.join(DISTILL_LORA_FILE);
+    if co_located.exists() {
+        return Ok(co_located);
+    }
+    Err(CandleError::Msg(format!(
+        "sensenova_u1_8b_fast: distill LoRA `{DISTILL_LORA_FILE}` not found — stage the \
+         'distill_lora' component in LoadSpec::components (with_component(\"distill_lora\", \
+         WeightsSource::File(...))) or co-locate the file in the snapshot dir {}. Download it with \
+         `huggingface-cli download {DISTILL_LORA_REPO} --include {DISTILL_LORA_FILE}`.",
+        root.display()
+    )))
+}

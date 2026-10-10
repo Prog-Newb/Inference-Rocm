@@ -1,0 +1,347 @@
+//! Bernini renderer knobs (the `bernini_renderer.json` sidecar emitted by the sc-4705 converter) +
+//! task/guidance-mode resolution + the CLI-default guidance scalars.
+
+use std::path::Path;
+
+use mlx_gen::{Error, GenerationRequest, Result};
+use mlx_gen_wan::config::{MAX_AREA_14B, SIZE_MULTIPLE_14B};
+
+use crate::forward::Mode;
+
+/// Shared request-geometry validation for **both** mlx Bernini entry points (the full `bernini`
+/// pipeline and the `bernini_renderer`), mirroring candle's
+/// `candle_gen_bernini::config::validate_bernini_geometry` so one manifest entry means one thing on
+/// both backends: reject an explicit `steps == 0`, a `width`/`height` that is not a multiple of
+/// [`SIZE_MULTIPLE_14B`], a **multi-frame** area over [`MAX_AREA_14B`], and a `num_frames` that is
+/// not `1 + 4·k`. `id` prefixes the message so each provider names itself.
+///
+/// sc-12454 (F-003): commit 83b512e9 (sc-12308) added the 14B video area cap to every candle Wan
+/// lane, both candle Bernini entry points, and every mlx Wan lane — but mlx Bernini was untouched,
+/// so a multi-frame 1280×1280 request (1.78× the envelope, the exact sc-9028 OOM geometry) validated
+/// here while candle hard-rejected it.
+///
+/// sc-12500 (F-040): the off-grid rejection replaces the silent `align_dim` refit — 1000×1000 used
+/// to render 992×992 on mlx with no diagnostic while candle errored. Both `generate_impl`s keep
+/// `align_dim` only as a no-op assert.
+///
+/// The area cap is deliberately **video-only** (`frames != Some(1)`) — see the comment at the check.
+pub fn validate_bernini_geometry(id: &str, req: &GenerationRequest) -> Result<()> {
+    if req.steps == Some(0) {
+        return Err(Error::Msg(format!(
+            "{id}: steps must be >= 1 (an explicit 0 renders undenoised noise)"
+        )));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE_14B) || !req.height.is_multiple_of(SIZE_MULTIPLE_14B)
+    {
+        return Err(Error::Msg(format!(
+            "{id}: width/height must be multiples of {SIZE_MULTIPLE_14B} (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    // sc-12308: [`MAX_AREA_14B`] is a **video** envelope — it bounds the denoise/decode peak of a
+    // multi-frame run (81 frames → 21 latent frames on the z16 VAE). The still-image lane
+    // (`bernini_image`, which the worker maps onto this same `bernini` engine with `frames: Some(1)`)
+    // renders ONE frame, ~21× less latent volume than an at-cap clip, so the video area budget does
+    // not describe it and must not gate it. The image lane stays bounded by the descriptor's
+    // `max_size` (1280 per edge), which the capability check enforces. Mirrors candle's carve-out.
+    let is_still_image = req.frames == Some(1);
+    let area = req.width as usize * req.height as usize;
+    if !is_still_image && area > MAX_AREA_14B {
+        return Err(Error::Msg(format!(
+            "{id}: width×height ({}×{} = {area} px) exceeds the max area {MAX_AREA_14B} px \
+             (1280×720); reduce the resolution",
+            req.width, req.height
+        )));
+    }
+    if let Some(f) = req.frames {
+        if f == 0 || f % 4 != 1 {
+            return Err(Error::Msg(format!(
+                "{id}: num_frames must be 1 + 4·k (got {f})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Read a knob sidecar JSON, distinguishing "absent" from "corrupt" (F-097). An **absent** file is a
+/// valid state — the loader falls back to the built-in defaults — and returns `Value::Null`. A
+/// **present but unreadable/invalid** file is a real error: reverting ALL knobs to defaults silently
+/// (the old `.ok().and_then(..ok())` behaviour) is worse than surfacing the corruption, so this
+/// returns `Err` instead of pretending the sidecar was absent.
+pub(crate) fn read_knob_sidecar(path: &Path) -> Result<serde_json::Value> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+            Error::Msg(format!(
+                "bernini: {} is present but not valid JSON: {e}",
+                path.display()
+            ))
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::Value::Null),
+        Err(e) => Err(Error::Msg(format!(
+            "bernini: reading {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// Bernini renderer inference knobs, read from the converter's `bernini_renderer.json` sidecar (else
+/// the upstream `BerniniRendererConfig` defaults).
+#[derive(Clone, Debug)]
+pub struct BerniniKnobs {
+    /// High→low expert switch boundary (× `num_train_timesteps`).
+    pub switch_dit_boundary: f32,
+    /// UniPC flow-shift (the reference builds the scheduler with `flow_shift = config.shift`).
+    pub shift: f32,
+    // NOTE: the reference `use_src_id_rotary_emb` toggle is NOT carried here — this port applies the
+    // source-id rotary embedding UNCONDITIONALLY (see `rope.rs` / `forward.rs::apply_source_id`),
+    // matching the Bernini renderer's shipped config (always `true`). Parsing it into a field the
+    // runtime then ignored would advertise a toggle that does nothing, so it is intentionally dropped.
+    pub interpolate_src_id: bool,
+    pub max_trained_src_id: f64,
+    pub max_sequence_length: usize,
+}
+
+impl Default for BerniniKnobs {
+    fn default() -> Self {
+        Self {
+            switch_dit_boundary: 0.875,
+            shift: 3.0,
+            interpolate_src_id: true,
+            max_trained_src_id: 5.0,
+            max_sequence_length: 512,
+        }
+    }
+}
+
+impl BerniniKnobs {
+    /// Read `<root>/bernini_renderer.json`; any missing field falls back to the default. An absent
+    /// sidecar yields all-defaults; a **present-but-corrupt** sidecar is an error (F-097), not a
+    /// silent revert of every knob to its default.
+    pub fn from_dir(root: &Path) -> Result<Self> {
+        let d = Self::default();
+        let v = read_knob_sidecar(&root.join("bernini_renderer.json"))?;
+        let f = |k: &str, dv: f32| {
+            v.get(k)
+                .and_then(serde_json::Value::as_f64)
+                .map(|x| x as f32)
+                .unwrap_or(dv)
+        };
+        let b = |k: &str, dv: bool| v.get(k).and_then(serde_json::Value::as_bool).unwrap_or(dv);
+        let i = |k: &str, dv: i64| v.get(k).and_then(serde_json::Value::as_i64).unwrap_or(dv);
+        Ok(Self {
+            switch_dit_boundary: f("switch_dit_boundary", d.switch_dit_boundary),
+            shift: f("shift", d.shift),
+            interpolate_src_id: b("interpolate_src_id", d.interpolate_src_id),
+            max_trained_src_id: f("max_trained_src_id", d.max_trained_src_id as f32) as f64,
+            // Clamp to >=0 before the usize cast: a negative `max_sequence_length` in JSON would wrap
+            // to a huge usize and drive an unbounded allocation downstream (F-080).
+            max_sequence_length: i("max_sequence_length", d.max_sequence_length as i64).max(0)
+                as usize,
+        })
+    }
+}
+
+/// CLI/gradio default guidance scalars (`bernini/cli.py add_common_args` + `run_*.sh`). A request's
+/// `guidance` overrides `omega_txt`; the rest are fixed defaults until the worker surfaces them.
+pub struct Defaults;
+impl Defaults {
+    pub const STEPS: usize = 40;
+    pub const NUM_FRAMES: usize = 81;
+    pub const OMEGA_VID: f32 = 1.25;
+    pub const OMEGA_IMG: f32 = 4.5;
+    pub const OMEGA_TXT: f32 = 4.0;
+    pub const OMEGA_SCALE: f32 = 0.8;
+    pub const ETA: f32 = 0.5;
+    pub const MOMENTUM: f32 = 0.0;
+    pub const NORM_THRESHOLD: f32 = 50.0;
+}
+
+/// Resolve the guidance [`Mode`] from the request's `video_mode` (a renderer **guidance mode** name
+/// preferred, else a **task_type** name) plus which conditioning is present. With no `video_mode`,
+/// default by conditioning: video+images ⇒ `rv2v`, video ⇒ `v2v_apg`, images ⇒ `v2v`, none ⇒ `t2v_apg`.
+pub fn resolve_mode(video_mode: Option<&str>, has_video: bool, has_image: bool) -> Mode {
+    if let Some(s) = video_mode {
+        if let Some(m) = Mode::from_name(s) {
+            return m;
+        }
+        if let Some(m) = task_to_mode(s) {
+            return m;
+        }
+    }
+    match (has_video, has_image) {
+        (true, true) => Mode::Rv2v,
+        (true, false) => Mode::V2vApg,
+        (false, true) => Mode::V2v,
+        (false, false) => Mode::T2vApg,
+    }
+}
+
+/// The upstream task_type → guidance_mode table (`gradio_demo.py` RENDERER_TASK_DEFAULTS). Used as a
+/// fallback when `video_mode` is a task name rather than a guidance-mode name.
+fn task_to_mode(task: &str) -> Option<Mode> {
+    Some(match task {
+        "t2i" | "t2v" => Mode::T2vApg,
+        "i2i" => Mode::V2v,
+        "v2v" | "mv2v" | "ads2v" => Mode::V2vApg,
+        "r2v" => Mode::R2vApg,
+        "rv2v" => Mode::Rv2v,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_resolution_prefers_guidance_then_task_then_conditioning() {
+        // Explicit guidance-mode name.
+        assert_eq!(resolve_mode(Some("rv2v"), false, false), Mode::Rv2v);
+        assert_eq!(resolve_mode(Some("t2v_apg"), false, false), Mode::T2vApg);
+        // Task name fallback (t2i/t2v → t2v_apg, r2v → r2v_apg).
+        assert_eq!(resolve_mode(Some("t2i"), false, false), Mode::T2vApg);
+        assert_eq!(resolve_mode(Some("r2v"), false, true), Mode::R2vApg);
+        // Conditioning-driven defaults.
+        assert_eq!(resolve_mode(None, false, false), Mode::T2vApg);
+        assert_eq!(resolve_mode(None, true, false), Mode::V2vApg);
+        assert_eq!(resolve_mode(None, false, true), Mode::V2v);
+        assert_eq!(resolve_mode(None, true, true), Mode::Rv2v);
+        // "t2v" as a guidance-mode name is the plain mode (from_name wins over the task table).
+        assert_eq!(resolve_mode(Some("t2v"), false, false), Mode::T2v);
+    }
+
+    #[test]
+    fn knobs_default_when_sidecar_missing() {
+        // An ABSENT sidecar is fine (defaults), not an error (F-097).
+        let k = BerniniKnobs::from_dir(Path::new("/nonexistent")).unwrap();
+        assert_eq!(k.switch_dit_boundary, 0.875);
+        assert_eq!(k.shift, 3.0);
+        assert_eq!(k.max_trained_src_id, 5.0);
+    }
+
+    #[test]
+    fn corrupt_sidecar_is_an_error_not_a_silent_revert() {
+        // A PRESENT-but-corrupt sidecar must surface (F-097) rather than reverting every knob to
+        // default. Write a garbage file into a temp dir and confirm `from_dir` errors.
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
+        std::fs::write(dir.join("bernini_renderer.json"), b"{ not valid json").unwrap();
+        let r = BerniniKnobs::from_dir(&dir);
+        assert!(r.is_err(), "corrupt sidecar must be an error");
+    }
+
+    /// sc-12454 (F-003) + sc-12500 (F-040): the shared geometry guard, mirroring candle's
+    /// `geometry_guard_rejects_bad_requests` — zero steps, off-grid sizes, over-area video, and bad
+    /// frame counts all reject before any weights load.
+    #[test]
+    fn geometry_guard_rejects_bad_requests() {
+        let base = GenerationRequest {
+            prompt: "x".into(),
+            width: 256,
+            height: 256,
+            ..Default::default()
+        };
+        assert!(validate_bernini_geometry("id", &base).is_ok());
+        // explicit zero steps
+        assert!(validate_bernini_geometry(
+            "id",
+            &GenerationRequest {
+                steps: Some(0),
+                ..base.clone()
+            }
+        )
+        .is_err());
+        // sc-12500 (F-040): an off-grid size is REJECTED, not silently `align_dim`-refit — 1000×1000
+        // used to render 992×992 on mlx with no diagnostic while candle errored on the same payload.
+        let err = validate_bernini_geometry(
+            "id",
+            &GenerationRequest {
+                width: 1000,
+                height: 1000,
+                ..base.clone()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("multiples of 16") && err.contains("1000x1000"),
+            "{err}"
+        );
+        // sc-12454 (F-003): a multi-frame 1280×1280 request — 1.78× the envelope, the exact sc-9028
+        // OOM geometry — is rejected like candle rejects it, instead of validating into an OOM.
+        let err = validate_bernini_geometry(
+            "id",
+            &GenerationRequest {
+                width: 1280,
+                height: 1280,
+                frames: Some(81),
+                ..base.clone()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("exceeds the max area 921600"), "{err}");
+        // `frames: None` defaults to a multi-frame video render, so it gets the cap too.
+        assert!(validate_bernini_geometry(
+            "id",
+            &GenerationRequest {
+                width: 1280,
+                height: 1024,
+                ..base.clone()
+            }
+        )
+        .is_err());
+        // frames not ≡ 1 (mod 4)
+        assert!(validate_bernini_geometry(
+            "id",
+            &GenerationRequest {
+                frames: Some(16),
+                ..base.clone()
+            }
+        )
+        .is_err());
+        assert!(validate_bernini_geometry(
+            "id",
+            &GenerationRequest {
+                frames: Some(17),
+                ..base.clone()
+            }
+        )
+        .is_ok());
+    }
+
+    /// sc-12308 / sc-12454: the area cap is a VIDEO envelope and must not gate the still-image lane.
+    /// `bernini_image` is mapped onto the same `bernini` engine by the worker with `frames: Some(1)`,
+    /// and its manifest default is 1024×1024 — over the 14B video budget. Mirrors candle's
+    /// `area_cap_is_video_only_and_admits_the_image_lane` so the carve-out cannot drift per backend.
+    #[test]
+    fn area_cap_is_video_only_and_admits_the_image_lane() {
+        let still = |w, h| GenerationRequest {
+            prompt: "x".into(),
+            width: w,
+            height: h,
+            frames: Some(1),
+            ..Default::default()
+        };
+
+        // The `bernini_image` manifest default (1 048 576 px) and its 720p buckets — all over the
+        // 921 600 video cap — must validate on the 1-frame lane.
+        const { assert!(1024 * 1024 > MAX_AREA_14B) };
+        assert!(validate_bernini_geometry("bernini_image", &still(1024, 1024)).is_ok());
+        assert!(validate_bernini_geometry("bernini_image", &still(1280, 720)).is_ok());
+        assert!(validate_bernini_geometry("bernini_image", &still(720, 1280)).is_ok());
+
+        // The image lane is still bound by the OTHER geometry guards — the 16-px grid in particular.
+        assert!(validate_bernini_geometry("bernini_image", &still(1000, 1000)).is_err());
+
+        // …and the video lane keeps its cap: the same geometry with a real frame count is rejected.
+        assert!(validate_bernini_geometry(
+            "bernini",
+            &GenerationRequest {
+                frames: Some(81),
+                ..still(1024, 1024)
+            }
+        )
+        .is_err());
+    }
+}

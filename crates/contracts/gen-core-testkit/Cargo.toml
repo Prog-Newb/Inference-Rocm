@@ -1,0 +1,26 @@
+[package]
+name = "sceneworks-gen-core-testkit"
+version = "0.1.0"
+edition = "2021"
+description = "Contract conformance suite for gen-core providers (cancel/progress/seed/capabilities). Zero tensor deps — runs against any Box<dyn Generator>, MLX or candle."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["diffusion", "inference", "generative", "contract", "testing"]
+categories = ["science"]
+
+[lib]
+# Neutral import path: `use gen_core_testkit::…` regardless of the (unique, publishable) package
+# name — mirrors the `gen_core` lib-name convention (epic 3720, D1).
+name = "gen_core_testkit"
+
+[dependencies]
+# The ONLY dependency: the backend-neutral contract. The testkit drives a provider purely through
+# the public `Generator` contract, so it links no tensor library and builds on Linux (the gen-core CI
+# lane) as readily as macOS — that backend-independence is the whole point (epic 3720, sc-4481).
+sceneworks-gen-core = { workspace = true }
+
+[dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }

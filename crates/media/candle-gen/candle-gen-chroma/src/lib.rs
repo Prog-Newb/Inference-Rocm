@@ -1,0 +1,376 @@
+//! # candle-gen-chroma
+//!
+//! The **Chroma** provider crate for [`candle-gen`](candle_gen) — the candle (Windows/CUDA) sibling
+//! of `mlx-gen-chroma`. It implements the backend-neutral [`gen_core::Generator`] contract and
+//! explicitly registers all three Chroma variants in its family catalog.
+//!
+//! **txt2img (sc-5484):** Chroma is a FLUX.1-schnell-derived DiT — the MMDiT skeleton with a
+//! distilled-guidance **Approximator** replacing FLUX's modulation stack, **T5-XXL-only**
+//! conditioning, and **true CFG** (a real negative prompt). `pipeline` adapts it through the
+//! contract: T5-XXL encode → the Chroma DiT (flow-match Euler, static-shift / beta sigmas) → the
+//! FLUX 16-ch AutoencoderKL, emitting `Progress` and honoring `req.cancel`, with **deterministic
+//! CPU-seeded noise** (sc-3673) so output is launch-portable per seed. The three variants:
+//!
+//! - **`chroma1_hd`** — high-detail full-CFG (28 steps, true_cfg 4.0, sigma shift 3.0).
+//! - **`chroma1_base`** — base full-CFG (28 steps, true_cfg 4.0, beta-spaced sigmas).
+//! - **`chroma1_flash`** — few-step distilled (8 steps, true_cfg 1.0 → single forward).
+//!
+//! The descriptors advertise **only** the wired txt2img surface (true-CFG + negative prompt, but NOT
+//! LoRA/LoKr, quantization, or ControlNet/IP-adapter) — so the worker routes the rest to the Python
+//! fallback rather than the candle backend silently dropping a control (the false-capability trap,
+//! exactly as the SDXL / FLUX / Z-Image slices did). `backend` is `"candle"` and `mac_only` is `false`.
+
+mod beta;
+mod config;
+mod pipeline;
+// Per-step latent previews (epic 16948, sc-16956). A re-export of `candle_gen_flux::preview`: Chroma
+// packs, unpacks and decodes the same 16-channel `AutoencoderKL` bytes as FLUX.1, so it shares that
+// crate's committed fit rather than restating it. See the module docs for the tensor-byte provenance.
+pub mod preview;
+mod quant;
+mod rope;
+mod text;
+mod transformer;
+mod vae;
+
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+use candle_gen::candle_core::{DType, Device};
+use candle_gen::gen_core::{
+    self, AdapterSpec, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor,
+    PidWeights, Progress, WeightsSource,
+};
+
+pub use config::{ChromaVariant, CHROMA1_BASE_ID, CHROMA1_FLASH_ID, CHROMA1_HD_ID, SIZE_MULTIPLE};
+
+use pipeline::{Components, Pipeline};
+
+/// Dense Chroma components that retain their checkpoint-native width.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NativeComponent {
+    T5,
+    Vae,
+}
+
+/// Chroma publishes its dense T5-XXL and FLUX.1 VAE tensors as BF16. Keeping the selections explicit
+/// makes either loader's precision policy independently testable.
+pub(crate) fn native_component_dtype(component: NativeComponent) -> DType {
+    match component {
+        NativeComponent::T5 => DType::BF16,
+        NativeComponent::Vae => DType::BF16,
+    }
+}
+
+/// A loaded candle Chroma generator (one per variant). Loading is **lazy**: `load` does no file I/O,
+/// and the heavy components (T5 + DiT + VAE) are built on the first [`generate`](Generator::generate)
+/// call and then cached.
+pub struct ChromaGenerator {
+    variant: ChromaVariant,
+    descriptor: ModelDescriptor,
+    root: PathBuf,
+    device: Device,
+    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
+    /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
+    pid_spec: Option<PidWeights>,
+    adapters: Vec<AdapterSpec>,
+    components: Mutex<Option<Components>>,
+}
+
+impl ChromaGenerator {
+    fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
+        // `?` bridges the candle-side `load_components` error into `gen_core::Error`.
+        Ok(candle_gen::cached(&self.components, || {
+            pipe.load_components()
+        })?)
+    }
+}
+
+impl Generator for ChromaGenerator {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        // The shared capability floor (size/count range; negative_prompt + true_cfg are advertised,
+        // so they pass; guidance / conditioning / unadvertised samplers are rejected here).
+        self.descriptor
+            .capabilities
+            .validate_request(self.variant.id(), req)?;
+        let id = self.variant.id();
+        if req.prompt.trim().is_empty() {
+            return Err(gen_core::Error::Msg(format!(
+                "{id}: prompt must not be empty"
+            )));
+        }
+        if req.steps == Some(0) {
+            return Err(gen_core::Error::Msg(format!(
+                "{id}: steps must be >= 1 (an explicit 0 renders undenoised noise)"
+            )));
+        }
+        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+            return Err(gen_core::Error::Msg(format!(
+                "{id}: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+                req.width, req.height
+            )));
+        }
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.validate(req)?;
+        let pipe = Pipeline::load(
+            self.variant,
+            &self.root,
+            &self.device,
+            self.pid_spec.clone(),
+            self.adapters.clone(),
+        );
+        let components = self.components(&pipe)?;
+        let images = pipe.render(req, &components, on_progress)?;
+        Ok(GenerationOutput::Images(images))
+    }
+}
+
+/// Descriptors (registry introspection — no weights).
+pub fn descriptor_hd() -> ModelDescriptor {
+    ChromaVariant::Hd.descriptor()
+}
+pub fn descriptor_base() -> ModelDescriptor {
+    ChromaVariant::Base.descriptor()
+}
+pub fn descriptor_flash() -> ModelDescriptor {
+    ChromaVariant::Flash.descriptor()
+}
+
+/// Construct a lazy candle Chroma generator for `variant`. `spec.weights` must be a
+/// [`WeightsSource::Dir`] pointing at a Chroma diffusers snapshot (`tokenizer/`, `text_encoder/`,
+/// `transformer/`, `vae/`). LoRA adapters, quantization, and control/IP-adapter overlays are rejected
+/// — none are wired in this slice, so refusing is more honest than silently dropping them.
+fn load_variant(variant: ChromaVariant, spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    let id = variant.id();
+    let root = match &spec.weights {
+        WeightsSource::Dir(p) => p.clone(),
+        WeightsSource::File(_) => {
+            return Err(gen_core::Error::Msg(format!(
+                "{id} expects a Chroma diffusers snapshot directory (tokenizer/, text_encoder/, \
+                 transformer/, vae/), not a single .safetensors file"
+            )));
+        }
+    };
+    if spec.quantize.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {id} does not support on-the-fly Q4/Q8 quantization yet"
+        )));
+    }
+    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {id} does not support control / IP-adapter overlays yet (txt2img only)"
+        )));
+    }
+    let device = candle_gen::default_device()?;
+    Ok(Box::new(ChromaGenerator {
+        variant,
+        descriptor: variant.descriptor(),
+        root,
+        device,
+        // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
+        // any) so the lazy component build loads the engine once. Unlike adapters/quant/control above,
+        // it is not rejected — `None` simply keeps the byte-exact native-VAE path.
+        pid_spec: spec.pid.clone(),
+        adapters: spec.adapters.clone(),
+        components: Mutex::new(None),
+    }))
+}
+
+pub fn load_hd(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_variant(ChromaVariant::Hd, spec)
+}
+pub fn load_base(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_variant(ChromaVariant::Base, spec)
+}
+pub fn load_flash(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_variant(ChromaVariant::Flash, spec)
+}
+
+// Link-time self-registration into gen-core's model registry — one descriptor per variant.
+candle_gen::register_generators! {
+    pub(crate) const HD_REGISTRATION = descriptor_hd => load_hd
+}
+candle_gen::register_generators! {
+    pub(crate) const BASE_REGISTRATION = descriptor_base => load_base
+}
+candle_gen::register_generators! {
+    pub(crate) const FLASH_REGISTRATION = descriptor_flash => load_flash
+}
+
+/// Add all Candle Chroma providers to an explicit media registry builder.
+pub fn register_providers(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(HD_REGISTRATION)
+        .register_generator(BASE_REGISTRATION)
+        .register_generator(FLASH_REGISTRATION)
+}
+
+/// Build the complete explicit Candle Chroma provider catalog.
+pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
+    register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    use candle_gen::candle_core::DType;
+
+    #[test]
+    fn dense_t5_and_vae_stay_at_their_native_bf16_width() {
+        assert_eq!(
+            super::native_component_dtype(super::NativeComponent::T5),
+            DType::BF16
+        );
+        assert_eq!(
+            super::native_component_dtype(super::NativeComponent::Vae),
+            DType::BF16
+        );
+    }
+
+    #[test]
+    fn explicit_catalog_has_stable_surface() {
+        let registry = super::provider_registry().unwrap();
+        let explicit: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+
+        assert_eq!(explicit, ["chroma1_hd", "chroma1_base", "chroma1_flash"]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_gen::gen_core::{Conditioning, Image, Modality};
+
+    #[test]
+    fn all_three_variants_register_and_resolve_as_candle() {
+        for id in [CHROMA1_HD_ID, CHROMA1_BASE_ID, CHROMA1_FLASH_ID] {
+            let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+            let g = crate::provider_registry()
+                .unwrap()
+                .load(id, &spec)
+                .unwrap_or_else(|_| panic!("candle {id} is registered"));
+            assert_eq!(g.descriptor().id, id);
+            assert_eq!(g.descriptor().family, "chroma");
+            assert_eq!(g.descriptor().backend, "candle");
+            assert_eq!(g.descriptor().modality, Modality::Image);
+        }
+    }
+
+    #[test]
+    fn validate_accepts_true_cfg_and_negative_rejects_unsupported() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let hd = crate::provider_registry()
+            .unwrap()
+            .load(CHROMA1_HD_ID, &spec)
+            .unwrap();
+
+        // True CFG + negative prompt are advertised → accepted.
+        let ok = GenerationRequest {
+            prompt: "a rusty robot holding a lit candle".into(),
+            negative_prompt: Some("blurry".into()),
+            true_cfg: Some(4.0),
+            ..Default::default()
+        };
+        assert!(hd.validate(&ok).is_ok());
+
+        for bad in [
+            GenerationRequest::default(), // empty prompt
+            GenerationRequest {
+                prompt: "x".into(),
+                guidance: Some(3.5), // distilled guidance not advertised
+                ..Default::default()
+            },
+            GenerationRequest {
+                prompt: "x".into(),
+                width: 1000, // not a multiple of 16
+                ..Default::default()
+            },
+            GenerationRequest {
+                prompt: "x".into(),
+                steps: Some(0),
+                ..Default::default()
+            },
+            GenerationRequest {
+                prompt: "x".into(),
+                conditioning: vec![Conditioning::Reference {
+                    image: Image::default(),
+                    strength: None,
+                }],
+                ..Default::default()
+            },
+        ] {
+            assert!(hd.validate(&bad).is_err(), "should reject: {bad:?}");
+        }
+
+        // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised Chroma
+        // bucket to. Pin the value and mutation-check that a size which is a multiple of 8 but not
+        // SIZE_MULTIPLE (16) is still rejected with the stride error, and an on-stride size passes.
+        assert_eq!(SIZE_MULTIPLE, 16);
+        let off_stride = hd
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1000, // 125×8 — a multiple of 8 but not SIZE_MULTIPLE
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            off_stride.contains("multiples of 16"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(hd
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1024, // 64×16 — on-stride
+                ..Default::default()
+            })
+            .is_ok());
+    }
+
+    #[test]
+    fn load_accepts_adapters_and_rejects_unwired_quant_and_single_file() {
+        use candle_gen::gen_core::{AdapterKind, AdapterSpec, Quant};
+        for load in [load_hd, load_base, load_flash] {
+            let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
+                AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
+            ]);
+            assert!(load(&lora).is_ok());
+
+            let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
+            assert!(matches!(
+                load(&quant).err().expect("err"),
+                gen_core::Error::Unsupported(_)
+            ));
+
+            let single = LoadSpec::new(WeightsSource::File("/x.safetensors".into()));
+            let err = load(&single).err().expect("err").to_string();
+            assert!(err.contains("snapshot directory"), "got: {err}");
+        }
+    }
+
+    /// A pre-cancelled request aborts before any forward with the typed `Canceled` (the cancellation
+    /// contract — sc-4481). The per-image cancel check runs before `denoise`, so loading lazily means
+    /// this needs no weights... except `generate` loads components first. Kept as a descriptor-level
+    /// check instead: `generate` on a nonexistent snapshot errors (not a panic).
+    #[test]
+    fn descriptors_are_image_modality() {
+        assert_eq!(descriptor_hd().modality, Modality::Image);
+        assert_eq!(descriptor_base().modality, Modality::Image);
+        assert_eq!(descriptor_flash().modality, Modality::Image);
+    }
+}

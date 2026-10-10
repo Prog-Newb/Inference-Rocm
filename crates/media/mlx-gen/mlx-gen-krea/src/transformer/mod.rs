@@ -1,0 +1,1674 @@
+//! The Krea 2 dense single-stream DiT (`Krea2Transformer2DModel` / reference `mmdit.py`
+//! `SingleStreamDiT`) forward.
+//!
+//! ```text
+//!   img_in:        img tokens = Linear(patchify(latent, p=2))          [b, img_len, 6144]
+//!   time_embed:    t   = Linear(GELU(Linear(sinusoid(timestep))))      [b, 1, 6144]
+//!   time_mod_proj: tvec = Linear(GELU(t))                              [b, 1, 6·6144]   (shared modulation)
+//!   text_fusion:   ctx = aggregate(stacked 12 Qwen3-VL layers)         [b, cap, 2560]
+//!   txt_in:        ctx = Linear(GELU(Linear(RMSNorm(ctx))))            [b, cap, 6144]
+//!   combined = [ctx ; img]                                            [b, cap+img_len, 6144]
+//!   28× transformer_blocks (gated single-stream, DoubleSharedModulation, 3-axis RoPE)
+//!   final_layer:   (1+scale)·RMSNorm(x) + shift → Linear(6144→64)      [b, cap+img_len, 64]
+//!   slice image tokens → unpatchify                                   → velocity [b, 16, H, W]
+//! ```
+//!
+//! Per-sample `B = 1`: the text stream is trimmed to its valid length (the encoder's padding mask) and
+//! the whole sequence runs **unmasked** — numerically exact for the image-velocity output (the
+//! reference's pad-to-256 + key/query mask only zeroes tokens that are then discarded).
+
+pub mod block;
+pub mod rope;
+
+use mlx_rs::error::{Exception, Result as MlxResult};
+use mlx_rs::ops::{concatenate_axis, cos, divide, exp, multiply, sin, split, sum};
+use mlx_rs::transforms::checkpoint;
+use mlx_rs::{Array, Dtype};
+
+use mlx_gen::array::scalar;
+use mlx_gen::nn::gelu_tanh;
+use mlx_gen::weights::Weights;
+use mlx_gen::Result;
+
+use crate::config::Krea2Config;
+use crate::quant::lin;
+use block::{RmsScale, SingleStreamBlock, TextFusionTransformer};
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, Adapter};
+use mlx_gen::attention::AttentionPlan;
+use mlx_gen::train::lora::LoraParams;
+use rope::RopeTables;
+
+/// The Krea 2 single-stream DiT.
+///
+/// `Clone` is a **shallow, refcounted** copy: MLX `Array`s are handles into shared device buffers,
+/// so cloning duplicates only the thin module/adapter-stack structs while the (large) weight tensors
+/// stay shared. This is what makes a **job-local DiT clone** cheap enough for the multi-phase render
+/// (epic 13879, sc-13884) to toggle its adapter stacks per phase (`clear_adapters` + a low-rank
+/// re-apply) without touching the shared resident DiT — the base weights are never mutated (adapters
+/// are forward-time residuals), so concurrent generates on the resident model are unaffected. The
+/// training path already relies on this shallow block clone (`SingleStreamBlock::clone` per step).
+#[derive(Clone)]
+pub struct Krea2Transformer {
+    cfg: Krea2Config,
+    dtype: Dtype,
+    img_in: AdaptableLinear,
+    time_embed_l1: AdaptableLinear,
+    time_embed_l2: AdaptableLinear,
+    time_mod_proj: AdaptableLinear,
+    txt_in_norm: RmsScale,
+    txt_in_l1: AdaptableLinear,
+    txt_in_l2: AdaptableLinear,
+    text_fusion: TextFusionTransformer,
+    blocks: Vec<SingleStreamBlock>,
+    /// Re-openable description of `transformer_blocks`, present only for deferred snapshot loads.
+    block_stream: Option<crate::block_stream::KreaBlockStream>,
+    final_norm: RmsScale,
+    final_linear: AdaptableLinear,
+    final_sstable: Array, // [1, 2, hidden]
+}
+
+impl Krea2Transformer {
+    /// Build from a loaded `transformer/` weight set (already validated by [`crate::convert`]).
+    pub fn from_weights(w: &Weights, cfg: &Krea2Config) -> Result<Self> {
+        let (heads, kv, hd, eps) = (
+            cfg.num_attention_heads as i32,
+            cfg.num_kv_heads as i32,
+            cfg.attention_head_dim as i32,
+            cfg.norm_eps,
+        );
+        let (theads, tkv) = (
+            cfg.text_num_attention_heads as i32,
+            cfg.text_num_kv_heads as i32,
+        );
+        let hidden = cfg.hidden_size as i32;
+
+        // The dense `img_in.bias` is always present and in the compute dtype (bf16 real / f32 fixture);
+        // the quantized snapshot only packs the attn/FFN Linears, so this never reads u32 codes.
+        let dtype = w.require("img_in.bias")?.dtype();
+
+        let final_sstable = w
+            .require("final_layer.scale_shift_table")?
+            .reshape(&[1, 2, hidden])?;
+
+        Ok(Self {
+            cfg: cfg.clone(),
+            dtype,
+            img_in: lin(w, "img_in", true)?,
+            time_embed_l1: lin(w, "time_embed.linear_1", true)?,
+            time_embed_l2: lin(w, "time_embed.linear_2", true)?,
+            time_mod_proj: lin(w, "time_mod_proj", true)?,
+            txt_in_norm: RmsScale::from_weights(w, "txt_in.norm.weight", eps)?,
+            txt_in_l1: lin(w, "txt_in.linear_1", true)?,
+            txt_in_l2: lin(w, "txt_in.linear_2", true)?,
+            text_fusion: TextFusionTransformer::from_weights(
+                w,
+                cfg.num_layerwise_text_blocks,
+                cfg.num_refiner_text_blocks,
+                theads,
+                tkv,
+                hd,
+                eps,
+            )?,
+            blocks: (0..cfg.num_layers)
+                .map(|i| {
+                    SingleStreamBlock::from_weights(
+                        w,
+                        &format!("transformer_blocks.{i}"),
+                        heads,
+                        kv,
+                        hd,
+                        hidden,
+                        eps,
+                    )
+                })
+                .collect::<Result<_>>()?,
+            block_stream: None,
+            final_norm: RmsScale::from_weights(w, "final_layer.norm.weight", eps)?,
+            final_linear: lin(w, "final_layer.linear", true)?,
+            final_sstable,
+        })
+    }
+
+    /// Arm bounded transformer residency for a re-openable transformer snapshot.
+    pub(crate) fn with_block_stream(mut self, source: mlx_gen::WeightsSource) -> Self {
+        self.block_stream = Some(crate::block_stream::KreaBlockStream::new(
+            source,
+            self.cfg.clone(),
+        ));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_block_stream(
+        mut self,
+        materializations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.block_stream = Some(crate::block_stream::KreaBlockStream::for_test(
+            self.cfg.clone(),
+            self.blocks.clone(),
+            materializations,
+        ));
+        self
+    }
+
+    pub(crate) fn block_window<'a>(
+        &self,
+        window_size: Option<usize>,
+        cancel: &'a mlx_gen::CancelFlag,
+    ) -> Result<Option<crate::block_stream::BlockWindow<'a>>> {
+        let Some(size) = window_size else {
+            return Ok(None);
+        };
+        if self.block_stream.is_none() {
+            return Err(mlx_gen::Error::Unsupported(
+                "krea: bounded transformer residency needs a deferred, re-openable snapshot load"
+                    .to_owned(),
+            ));
+        }
+        Ok(Some(crate::block_stream::BlockWindow {
+            plan: mlx_gen::block_residency::BlockPlan::new(self.blocks.len(), size)?,
+            cancel,
+        }))
+    }
+
+    /// Re-snapshot the forward-time adapter stacks after a load or a job-local multi-phase reapply.
+    pub(crate) fn capture_block_adapters(&mut self) {
+        if let Some(stream) = self.block_stream.as_mut() {
+            stream.capture_adapters(&mut self.blocks);
+        }
+    }
+
+    fn disarm_block_stream(&mut self) {
+        self.block_stream = None;
+    }
+
+    /// Velocity prediction.
+    ///
+    /// - `latent`: `[b, 16, H, W]` (H, W multiples of `patch_size`),
+    /// - `timestep`: `[b]` f32 (raw flow time in `[0, 1]`),
+    /// - `context`: `[b, n_tokens, num_text_layers, text_hidden]` — the stacked Qwen3-VL select-layer
+    ///   hidden states (sc-7569),
+    /// - `mask`: `Some([b, n_tokens])` to trim the text stream to its valid length (B = 1), or `None`
+    ///   (all tokens valid).
+    ///
+    /// Returns the velocity `[b, 16, H, W]`.
+    pub fn forward(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        context: &Array,
+        mask: Option<&Array>,
+    ) -> Result<Array> {
+        let prep = self.prepare(context, mask, latent)?;
+        self.forward_prepared(latent, timestep, &prep)
+    }
+
+    /// Build the **step-invariant** conditioning ([`JointPrep`]): the fused + projected text stream
+    /// and the joint RoPE tables. Neither depends on the noise latent's *values* or the timestep —
+    /// only on `context`/`mask` and the latent *shape* — so a denoise loop builds this ONCE and reuses
+    /// it across every step (F-079, the qwen F-115 precedent), instead of re-running the 12-layer text
+    /// fusion + text-in projection + `RopeTables::build_t2i` (~1M host trig ops) on every forward.
+    pub fn prepare(
+        &self,
+        context: &Array,
+        mask: Option<&Array>,
+        latent: &Array,
+    ) -> Result<JointPrep> {
+        let cfg = &self.cfg;
+        let p = cfg.patch_size as i32;
+        let sh = latent.shape();
+        let (h, w) = (sh[2], sh[3]);
+        let (ht, wt) = (h / p, w / p);
+        let latent_ch = cfg.in_channels as i32 / (p * p);
+
+        // Trim + fuse + project the text stream (step-invariant), shared with the edit path.
+        let (ctx, cap_len) = self.text_stream(context, mask)?;
+
+        // Joint RoPE tables (also step-invariant: depend only on cap_len + image grid).
+        let rope = RopeTables::build_t2i(
+            cap_len as usize,
+            ht as usize,
+            wt as usize,
+            cfg.axes_dims_rope,
+            cfg.rope_theta as f64,
+        );
+        let (rcos, rsin) = rope.joint();
+        Ok(JointPrep {
+            ctx,
+            rcos,
+            rsin,
+            cap_len,
+            ht,
+            wt,
+            latent_ch,
+            p,
+        })
+    }
+
+    /// Trim the (B = 1) text stream to its valid `cap_len` (the encoder's padding mask), then run the
+    /// 12-layer text fusion + the text-input projection → `([b, cap, hidden], cap_len)`. Step-invariant
+    /// (depends only on `context`/`mask`), so both [`prepare`](Self::prepare) and
+    /// [`prepare_edit`](Self::prepare_edit) hoist it out of the denoise loop. Factored out so the two
+    /// paths share one text-stream implementation.
+    fn text_stream(&self, context: &Array, mask: Option<&Array>) -> Result<(Array, i32)> {
+        let dt = self.dtype;
+        let n_tok = context.shape()[1];
+        let cap_len = match mask {
+            Some(m) => sum(&m.as_dtype(Dtype::Float32)?, false)?.item::<f32>() as i32,
+            None => n_tok,
+        };
+        // Contiguous head slice `[0, cap_len)` via a split boundary, not an arange-gather (F-114).
+        let context = split_axis1(context, cap_len)?.swap_remove(0).as_dtype(dt)?;
+        let ctx = self.text_fusion.forward(&context)?; // [b, cap, text_hidden]
+        let ctx = self.txt_in_norm.forward(&ctx)?;
+        let ctx = self
+            .txt_in_l2
+            .forward(&gelu_tanh(&self.txt_in_l1.forward(&ctx)?)?)?; // [b, cap, hidden]
+        Ok((ctx, cap_len))
+    }
+
+    /// Build the **step-invariant** conditioning for a Kontext-style **edit** forward ([`EditPrep`]): the
+    /// fused text stream, the CLEAN in-context reference tokens embedded through the (adapter-carrying)
+    /// `img_in`, and the joint 3-axis RoPE laid out `[text ; refs… ; target]` with each reference at its
+    /// own frame (see [`rope::RopeTables::build_edit`]). `noise_latent` supplies only the target grid
+    /// geometry (its *values* are not read). Each entry of `ref_latents` is a `[b, 16, H, W]` VAE latent
+    /// at the SAME resolution as `noise_latent` (the references share the target grid), in the fixed
+    /// source order (scene, then subject). Like [`prepare`](Self::prepare), this runs ONCE per denoise —
+    /// the reference tokens are clean (timestep-independent), so they are hoisted here, not re-embedded
+    /// per step.
+    pub fn prepare_edit(
+        &self,
+        context: &Array,
+        mask: Option<&Array>,
+        noise_latent: &Array,
+        ref_latents: &[Array],
+    ) -> Result<EditPrep> {
+        let cfg = &self.cfg;
+        let p = cfg.patch_size as i32;
+        let dt = self.dtype;
+        let sh = noise_latent.shape();
+        let (h, w) = (sh[2], sh[3]);
+        let (ht, wt) = (h / p, w / p);
+        let latent_ch = cfg.in_channels as i32 / (p * p);
+
+        let (ctx, cap_len) = self.text_stream(context, mask)?;
+
+        // Embed each clean reference latent through the SAME `img_in` as the noise (adapters included);
+        // the reference tokens are step-invariant, so this hoist mirrors the text-stream one.
+        let n_refs = ref_latents.len();
+        let ref_tokens = if n_refs == 0 {
+            None
+        } else {
+            let embedded: Vec<Array> = ref_latents
+                .iter()
+                .map(|r| self.img_in.forward(&patchify(&r.as_dtype(dt)?, p)?))
+                .collect::<Result<_>>()?;
+            let refs: Vec<&Array> = embedded.iter().collect();
+            Some(concatenate_axis(&refs, 1)?) // [b, n_refs·ht·wt, hidden]
+        };
+
+        // Joint RoPE with the reference frames inserted between text and target (Kontext layout).
+        let rope = RopeTables::build_edit(
+            cap_len as usize,
+            ht as usize,
+            wt as usize,
+            n_refs,
+            cfg.axes_dims_rope,
+            cfg.rope_theta as f64,
+        );
+        let (rcos, rsin) = rope.joint();
+        Ok(EditPrep {
+            ctx,
+            ref_tokens,
+            rcos,
+            rsin,
+            cap_len,
+            ht,
+            wt,
+            latent_ch,
+            p,
+            n_refs: n_refs as i32,
+        })
+    }
+
+    /// Velocity prediction for the **edit** path from a precomputed [`EditPrep`]: patch-embed the noise
+    /// target, assemble the joint sequence `[ctx ; refs ; noise]`, run the block stack under the same
+    /// shared modulation `tvec`, then the final layer — and slice back ONLY the noise (target) tokens,
+    /// the contiguous tail after `cap_len + n_refs·(ht·wt)`. Numerically the text-to-image
+    /// [`forward_prepared`](Self::forward_prepared) with the reference tokens spliced in and the RoPE
+    /// carrying their frame offset; `in_channels` is unchanged (sequence concat, not channel concat).
+    pub fn forward_prepared_edit(
+        &self,
+        noise_latent: &Array,
+        timestep: &Array,
+        prep: &EditPrep,
+    ) -> Result<Array> {
+        self.forward_prepared_edit_windowed_budgeted(
+            noise_latent,
+            timestep,
+            prep,
+            None,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    fn edit_joint_inputs(
+        &self,
+        noise_latent: &Array,
+        timestep: &Array,
+        prep: &EditPrep,
+    ) -> Result<(Array, Array, Array)> {
+        let cfg = &self.cfg;
+        let dt = self.dtype;
+
+        // Noise (target) patch embed.
+        let img = self
+            .img_in
+            .forward(&patchify(&noise_latent.as_dtype(dt)?, prep.p)?)?; // [b, img_len, hidden]
+
+        // Timestep embed → `t`; shared modulation `tvec` — identical to `joint_inputs` (one timestep
+        // broadcasts over the whole sequence; the reference tokens' "clean" role is carried by their
+        // RoPE frame + the LoRA, not a per-token timestep).
+        let t_sin = temb(timestep, cfg.timestep_embed_dim as i32)?.as_dtype(dt)?; // [b, 1, tdim]
+        let t = self
+            .time_embed_l2
+            .forward(&gelu_tanh(&self.time_embed_l1.forward(&t_sin)?)?)?; // [b, 1, hidden]
+        let tvec = self.time_mod_proj.forward(&gelu_tanh(&t)?)?; // [b, 1, 6·hidden]
+
+        // Joint sequence `[ctx ; refs ; noise]` (references present only when `n_refs > 0`).
+        let mut parts: Vec<&Array> = Vec::with_capacity(3);
+        parts.push(&prep.ctx);
+        if let Some(rt) = &prep.ref_tokens {
+            parts.push(rt);
+        }
+        parts.push(&img);
+        Ok((concatenate_axis(&parts, 1)?, t, tvec))
+    }
+
+    /// Velocity prediction from a precomputed [`JointPrep`] — runs the per-step compute only: image
+    /// patch embed, timestep embed + shared modulation, joint-sequence assembly, the block stack, and
+    /// the final layer. Numerically identical to [`forward`](Self::forward) given the same prep.
+    pub fn forward_prepared(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        prep: &JointPrep,
+    ) -> Result<Array> {
+        let j = self.joint_inputs(latent, timestep, prep)?;
+        let combined = self.run_blocks(
+            j.combined.clone(),
+            &j.tvec,
+            &j.rcos,
+            &j.rsin,
+            None,
+            AttentionPlan::UNBOUNDED,
+        )?;
+        self.finalize(&combined, &j.t, &j)
+    }
+
+    /// Prepared text-to-image/img2img forward with an optional shared block-residency window.
+    #[cfg(test)]
+    pub(crate) fn forward_prepared_windowed(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        prep: &JointPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        self.forward_prepared_windowed_budgeted(
+            latent,
+            timestep,
+            prep,
+            window,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    pub(crate) fn forward_prepared_windowed_budgeted(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        prep: &JointPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
+        let j = self.joint_inputs(latent, timestep, prep)?;
+        let combined = self.run_blocks(
+            j.combined.clone(),
+            &j.tvec,
+            &j.rcos,
+            &j.rsin,
+            window,
+            attention,
+        )?;
+        self.finalize(&combined, &j.t, &j)
+    }
+
+    /// Run conditional and unconditional prepared states through one block traversal. Under bounded
+    /// residency each block is reconstructed once, then applied to both independent carries before
+    /// both are evaluated and the window is released.
+    #[cfg(test)]
+    pub(crate) fn forward_prepared_pair_windowed(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        positive: &JointPrep,
+        negative: &JointPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<(Array, Array)> {
+        self.forward_prepared_pair_windowed_budgeted(
+            latent,
+            timestep,
+            positive,
+            negative,
+            window,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    pub(crate) fn forward_prepared_pair_windowed_budgeted(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        positive: &JointPrep,
+        negative: &JointPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<(Array, Array)> {
+        let positive = self.joint_inputs(latent, timestep, positive)?;
+        let negative = self.joint_inputs(latent, timestep, negative)?;
+        let (positive_combined, negative_combined) = self.run_blocks_paired(
+            (positive.combined.clone(), negative.combined.clone()),
+            (&positive.tvec, &positive.rcos, &positive.rsin),
+            (&negative.tvec, &negative.rcos, &negative.rsin),
+            window,
+            attention,
+        )?;
+        Ok((
+            self.finalize(&positive_combined, &positive.t, &positive)?,
+            self.finalize(&negative_combined, &negative.t, &negative)?,
+        ))
+    }
+
+    /// Prepared edit forward with the same windowing semantics as the ordinary prepared forward.
+    #[cfg(test)]
+    pub(crate) fn forward_prepared_edit_windowed(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        prep: &EditPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        self.forward_prepared_edit_windowed_budgeted(
+            latent,
+            timestep,
+            prep,
+            window,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    pub(crate) fn forward_prepared_edit_windowed_budgeted(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        prep: &EditPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
+        let (mut combined, t, tvec) = self.edit_joint_inputs(latent, timestep, prep)?;
+        combined = self.run_blocks(combined, &tvec, &prep.rcos, &prep.rsin, window, attention)?;
+        let out = self.final_layer(&combined, &t)?;
+        let img_len = prep.ht * prep.wt;
+        let head = prep.cap_len + prep.n_refs * img_len;
+        let img_out = split_axis1(&out, head)?.swap_remove(1);
+        unpatchify(&img_out, prep.ht, prep.wt, prep.p, prep.latent_ch)
+    }
+
+    /// Paired conditional/unconditional edit forward with one block-window traversal.
+    #[cfg(test)]
+    pub(crate) fn forward_prepared_edit_pair_windowed(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        positive: &EditPrep,
+        negative: &EditPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<(Array, Array)> {
+        self.forward_prepared_edit_pair_windowed_budgeted(
+            latent,
+            timestep,
+            positive,
+            negative,
+            window,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    pub(crate) fn forward_prepared_edit_pair_windowed_budgeted(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        positive: &EditPrep,
+        negative: &EditPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<(Array, Array)> {
+        let (positive_combined, positive_t, positive_tvec) =
+            self.edit_joint_inputs(latent, timestep, positive)?;
+        let (negative_combined, negative_t, negative_tvec) =
+            self.edit_joint_inputs(latent, timestep, negative)?;
+        let (positive_combined, negative_combined) = self.run_blocks_paired(
+            (positive_combined, negative_combined),
+            (&positive_tvec, &positive.rcos, &positive.rsin),
+            (&negative_tvec, &negative.rcos, &negative.rsin),
+            window,
+            attention,
+        )?;
+        let finish = |combined: &Array, t: &Array, prep: &EditPrep| -> Result<Array> {
+            let out = self.final_layer(combined, t)?;
+            let img_len = prep.ht * prep.wt;
+            let head = prep.cap_len + prep.n_refs * img_len;
+            let img_out = split_axis1(&out, head)?.swap_remove(1);
+            unpatchify(&img_out, prep.ht, prep.wt, prep.p, prep.latent_ch)
+        };
+        Ok((
+            finish(&positive_combined, &positive_t, positive)?,
+            finish(&negative_combined, &negative_t, negative)?,
+        ))
+    }
+
+    /// Pose-control forward over the same request-scoped base-block window as the ordinary routes.
+    /// The control branch remains a separately-accounted resident overlay; `inject` applies its
+    /// precomputed residual immediately before each matching frozen base block.
+    pub(crate) fn forward_prepared_injected_windowed(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        prep: &JointPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+        mut inject: impl FnMut(usize, Array, i32) -> Result<Array>,
+    ) -> Result<Array> {
+        let j = self.joint_inputs(latent, timestep, prep)?;
+        let combined = self.run_blocks_injected(
+            j.combined.clone(),
+            &j.tvec,
+            &j.rcos,
+            &j.rsin,
+            window,
+            attention,
+            j.cap_len,
+            &mut inject,
+        )?;
+        self.finalize(&combined, &j.t, &j)
+    }
+
+    fn run_blocks_paired(
+        &self,
+        mut states: (Array, Array),
+        positive: (&Array, &Array, &Array),
+        negative: (&Array, &Array, &Array),
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<(Array, Array)> {
+        let Some(window) = window else {
+            for block in &self.blocks {
+                states.0 = block
+                    .forward_budgeted(&states.0, positive.0, positive.1, positive.2, attention)?;
+                states.1 = block
+                    .forward_budgeted(&states.1, negative.0, negative.1, negative.2, attention)?;
+            }
+            return Ok(states);
+        };
+        let stream = self.block_stream.as_ref().ok_or_else(|| {
+            mlx_gen::Error::Unsupported(
+                "krea: bounded transformer residency was requested without a re-openable block stream"
+                    .to_owned(),
+            )
+        })?;
+        if window.plan.n_blocks() != self.blocks.len() || stream.n_blocks() != self.blocks.len() {
+            return Err(mlx_gen::Error::Msg(format!(
+                "krea: block plan covers {} blocks and the stream {}, but the DiT has {}",
+                window.plan.n_blocks(),
+                stream.n_blocks(),
+                self.blocks.len()
+            )));
+        }
+        mlx_gen::block_residency::run_windowed(
+            &window.plan,
+            window.cancel,
+            states,
+            || stream.open(),
+            |states, view, range| {
+                run_paired_range(
+                    states,
+                    range,
+                    |index| stream.materialize(view, index),
+                    |block, state| {
+                        block
+                            .forward_budgeted(&state, positive.0, positive.1, positive.2, attention)
+                    },
+                    |block, state| {
+                        block
+                            .forward_budgeted(&state, negative.0, negative.1, negative.2, attention)
+                    },
+                )
+            },
+            |(positive, negative): &(Array, Array)| {
+                Ok(mlx_rs::transforms::eval([positive, negative])?)
+            },
+        )
+    }
+
+    fn run_blocks(
+        &self,
+        mut combined: Array,
+        tvec: &Array,
+        rcos: &Array,
+        rsin: &Array,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
+        let Some(window) = window else {
+            for block in &self.blocks {
+                combined = block.forward_budgeted(&combined, tvec, rcos, rsin, attention)?;
+            }
+            return Ok(combined);
+        };
+        let stream = self.block_stream.as_ref().ok_or_else(|| {
+            mlx_gen::Error::Unsupported(
+                "krea: bounded transformer residency was requested without a re-openable block stream"
+                    .to_owned(),
+            )
+        })?;
+        if window.plan.n_blocks() != self.blocks.len() || stream.n_blocks() != self.blocks.len() {
+            return Err(mlx_gen::Error::Msg(format!(
+                "krea: block plan covers {} blocks and the stream {}, but the DiT has {}",
+                window.plan.n_blocks(),
+                stream.n_blocks(),
+                self.blocks.len()
+            )));
+        }
+        mlx_gen::block_residency::run_windowed(
+            &window.plan,
+            window.cancel,
+            combined,
+            || stream.open(),
+            |state, view, range| {
+                let mut current = state;
+                for index in range {
+                    let block = stream.materialize(view, index)?;
+                    current = block.forward_budgeted(&current, tvec, rcos, rsin, attention)?;
+                }
+                Ok(current)
+            },
+            |state: &Array| Ok(mlx_rs::transforms::eval([state])?),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_blocks_injected(
+        &self,
+        mut combined: Array,
+        tvec: &Array,
+        rcos: &Array,
+        rsin: &Array,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+        cap_len: i32,
+        inject: &mut impl FnMut(usize, Array, i32) -> Result<Array>,
+    ) -> Result<Array> {
+        let Some(window) = window else {
+            for (index, block) in self.blocks.iter().enumerate() {
+                combined = inject(index, combined, cap_len)?;
+                combined = block.forward_budgeted(&combined, tvec, rcos, rsin, attention)?;
+            }
+            return Ok(combined);
+        };
+        let stream = self.block_stream.as_ref().ok_or_else(|| {
+            mlx_gen::Error::Unsupported(
+                "krea: bounded transformer residency was requested without a re-openable block stream"
+                    .to_owned(),
+            )
+        })?;
+        if window.plan.n_blocks() != self.blocks.len() || stream.n_blocks() != self.blocks.len() {
+            return Err(mlx_gen::Error::Msg(format!(
+                "krea: block plan covers {} blocks and the stream {}, but the DiT has {}",
+                window.plan.n_blocks(),
+                stream.n_blocks(),
+                self.blocks.len()
+            )));
+        }
+        mlx_gen::block_residency::run_windowed(
+            &window.plan,
+            window.cancel,
+            combined,
+            || stream.open(),
+            |state, view, range| {
+                let mut current = state;
+                for index in range {
+                    current = inject(index, current, cap_len)?;
+                    let block = stream.materialize(view, index)?;
+                    current = block.forward_budgeted(&current, tvec, rcos, rsin, attention)?;
+                }
+                Ok(current)
+            },
+            |state: &Array| Ok(mlx_rs::transforms::eval([state])?),
+        )
+    }
+
+    /// Velocity prediction with **per-single-stream-block gradient checkpointing** (sc-7577, training
+    /// only). Numerically identical to [`forward`](Self::forward), but each of the `num_layers` blocks
+    /// runs inside an `mlx::checkpoint` segment whose explicit inputs are the joint hidden state plus
+    /// that block's trainable LoRA factors — so the backward recomputes the block instead of retaining
+    /// its activations (bounding the first-step working set), while gradients still flow to the LoRA
+    /// params. The pre-block embedders / text-fusion and the final layer run normally (any LoRA on them
+    /// is installed on `self` by the caller and trains through ordinary autograd).
+    ///
+    /// `params` is the live trainable factor map; `block_local_targets[i]` lists the adapter-routable
+    /// LOCAL paths (e.g. `"attn.to_q"`) trained on single-stream block `i`, in the order their factors
+    /// are threaded as checkpoint inputs. Blocks with no trained targets still run checkpointed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_blocks_checkpointed(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        context: &Array,
+        mask: Option<&Array>,
+        params: &LoraParams,
+        block_local_targets: &[Vec<String>],
+        alpha: f32,
+    ) -> Result<Array> {
+        let prep = self.prepare(context, mask, latent)?;
+        let j = self.joint_inputs(latent, timestep, &prep)?;
+        let mut combined = j.combined.clone();
+        for (i, blk) in self.blocks.iter().enumerate() {
+            // Cheap clone (Arrays are refcounted): the closure must OWN its state because the backward
+            // recompute runs after this frame is gone. `set_adapters` inside the closure replaces
+            // whatever the clone carried with the explicit-input LoRA, so any caller-installed block
+            // adapters are moot here.
+            let mut b = blk.clone();
+            let locals = block_local_targets.get(i).cloned().unwrap_or_default();
+            let tvec = j.tvec.clone();
+            let rcos = j.rcos.clone();
+            let rsin = j.rsin.clone();
+
+            // Threaded inputs: [hidden, a_0, b_0, a_1, b_1, …] (raw `[r,in]`/`[out,r]` factors).
+            let mut inputs: Vec<Array> = Vec::with_capacity(1 + 2 * locals.len());
+            inputs.push(combined.clone());
+            for local in &locals {
+                let ak = format!("transformer_blocks.{i}.{local}.lora_a");
+                let bk = format!("transformer_blocks.{i}.{local}.lora_b");
+                inputs.push(
+                    params
+                        .get(ak.as_str())
+                        .ok_or_else(|| mlx_gen::Error::Msg(format!("LoRA param missing: {ak}")))?
+                        .clone(),
+                );
+                inputs.push(
+                    params
+                        .get(bk.as_str())
+                        .ok_or_else(|| mlx_gen::Error::Msg(format!("LoRA param missing: {bk}")))?
+                        .clone(),
+                );
+            }
+
+            let alpha_c = alpha;
+            let mut seg = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
+                // Reinstall the explicit-input factors with the SAME `(transpose, alpha/rank fold,
+                // scale = 1)` `install_training_lora` applies, so the checkpointed block forward is
+                // numerically identical to the installed-adapter path and grads route to `inp`.
+                // Dtype-following on the hidden state (bf16 training): the f32 factors join the bf16
+                // stream so the adapted Linear stays bf16; no-op in f32. Grads flow back through astype.
+                let dt = inp[0].dtype();
+                for (k, local) in locals.iter().enumerate() {
+                    let a = inp[1 + 2 * k].t().as_dtype(dt)?; // [r,in] -> [in,r]
+                    let rank = a.shape()[1] as f32;
+                    let bb = inp[2 + 2 * k]
+                        .t() // [out,r] -> [r,out]
+                        .multiply(Array::from_slice(&[alpha_c / rank], &[1]))?
+                        .as_dtype(dt)?;
+                    let segs: Vec<&str> = local.split('.').collect();
+                    b.adaptable_mut(&segs)
+                        .ok_or_else(|| {
+                            Exception::custom(format!("checkpoint LoRA target not found: {local}"))
+                        })?
+                        .set_training_adapters(vec![Adapter::Lora {
+                            a,
+                            b: bb,
+                            scale: 1.0,
+                        }]);
+                }
+                let out = b
+                    .forward(&inp[0], &tvec, &rcos, &rsin)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                Ok(vec![out])
+            });
+            combined = seg(&inputs)?.into_iter().next().ok_or_else(|| {
+                mlx_gen::Error::Msg("krea: checkpoint block produced no output".into())
+            })?;
+        }
+        self.finalize(&combined, &j.t, &j)
+    }
+
+    /// The step-invariant + value-dependent embed/fuse preamble shared by [`forward`](Self::forward)
+    /// and [`forward_with_blocks_checkpointed`](Self::forward_with_blocks_checkpointed): image patch
+    /// embed, timestep + shared modulation, text-fusion + text-in projection, the joint `[ctx; img]`
+    /// sequence, and the joint RoPE tables. Returns everything the block stack + final layer consume.
+    /// The per-step embed/assemble stage: image patch embed + timestep embed/modulation, fused with
+    /// the step-invariant text stream + RoPE from [`prep`](JointPrep) into the joint inputs the block
+    /// stack + final layer consume.
+    pub(crate) fn joint_inputs(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        prep: &JointPrep,
+    ) -> Result<JointInputs> {
+        let cfg = &self.cfg;
+        let dt = self.dtype;
+
+        // Image patch embed.
+        let img = self
+            .img_in
+            .forward(&patchify(&latent.as_dtype(dt)?, prep.p)?)?; // [b, img_len, hidden]
+
+        // Timestep embed → `t`; shared modulation `tvec = time_mod_proj(GELU(t))`.
+        let t_sin = temb(timestep, cfg.timestep_embed_dim as i32)?.as_dtype(dt)?; // [b, 1, tdim]
+        let t = self
+            .time_embed_l2
+            .forward(&gelu_tanh(&self.time_embed_l1.forward(&t_sin)?)?)?; // [b, 1, hidden]
+        let tvec = self.time_mod_proj.forward(&gelu_tanh(&t)?)?; // [b, 1, 6·hidden]
+
+        // Fuse the (precomputed) text stream to the joint sequence.
+        let combined = concatenate_axis(&[&prep.ctx, &img], 1)?; // [b, cap+img_len, hidden]
+        Ok(JointInputs {
+            combined,
+            t,
+            tvec,
+            rcos: prep.rcos.clone(),
+            rsin: prep.rsin.clone(),
+            cap_len: prep.cap_len,
+            ht: prep.ht,
+            wt: prep.wt,
+            latent_ch: prep.latent_ch,
+            p: prep.p,
+        })
+    }
+
+    /// Continuous-AdaLN output (SimpleModulation on `t`), then slice the image tokens + unpatchify.
+    pub(crate) fn finalize(&self, combined: &Array, t: &Array, j: &JointInputs) -> Result<Array> {
+        let out = self.final_layer(combined, t)?; // [b, cap+img_len, in_channels]
+                                                  // The image tokens are the contiguous tail `[cap_len, cap_len+img_len)` — split at the caption
+                                                  // boundary rather than gathering an arange (F-114). `out` has length exactly `cap+img_len`.
+        let img_out = split_axis1(&out, j.cap_len)?.swap_remove(1);
+        unpatchify(&img_out, j.ht, j.wt, j.p, j.latent_ch)
+    }
+
+    /// Toggle SDPA-segment gradient checkpointing on every single-stream + text-fusion block (sc-7577,
+    /// training only). Numerically identical to the retained backward; the trainer turns it OFF when
+    /// whole-block checkpointing is on (the block recompute already covers attention). Inference never
+    /// calls it (attention stays the un-checkpointed fused SDPA).
+    pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.disarm_block_stream();
+        for b in &mut self.blocks {
+            b.set_sdpa_checkpoint(on);
+        }
+        self.text_fusion.set_sdpa_checkpoint(on);
+    }
+
+    /// The DiT's current compute dtype (probed from `img_in.bias`, set at load from the snapshot).
+    pub fn compute_dtype(&self) -> Dtype {
+        self.dtype
+    }
+
+    /// Number of single-stream `transformer_blocks` (`num_layers`) — the trainer's gradient-checkpoint
+    /// bookkeeping indexes per block.
+    pub fn num_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Patch-embed a latent through the frozen base `img_in` (the SAME embedder the noisy image latent
+    /// uses in [`Self::joint_inputs`]), producing image tokens `[b, img_len, hidden]`. The pose-control
+    /// branch (sc-8465) embeds the VAE-encoded pose latent through this so its control tokens live in
+    /// the base image-token space before they are added onto the branch input.
+    pub(crate) fn embed_latent(&self, latent: &Array) -> Result<Array> {
+        self.img_in.forward(&patchify(
+            &latent.as_dtype(self.dtype)?,
+            self.cfg.patch_size as i32,
+        )?)
+    }
+
+    /// Cast the whole DiT to the training compute `dtype` in place (sc-7577). The `RmsScale` norms
+    /// always reduce in f32 (kept precise); everything else — embedders, modulation, text-fusion,
+    /// single-stream blocks, final layer, scale-shift tables — is cast. Destructive for a narrowing
+    /// cast (f32→bf16); reload for f32. Inference never calls this.
+    pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        self.disarm_block_stream();
+        for l in [
+            &mut self.img_in,
+            &mut self.time_embed_l1,
+            &mut self.time_embed_l2,
+            &mut self.time_mod_proj,
+            &mut self.txt_in_l1,
+            &mut self.txt_in_l2,
+            &mut self.final_linear,
+        ] {
+            l.cast_weights(dtype)?;
+        }
+        self.text_fusion.cast_weights(dtype)?;
+        for b in &mut self.blocks {
+            b.cast_weights(dtype)?;
+        }
+        if self.final_sstable.dtype() != dtype {
+            self.final_sstable = self.final_sstable.as_dtype(dtype)?;
+        }
+        self.dtype = dtype;
+        Ok(())
+    }
+
+    /// Reference `LastLayer`: `SimpleModulation(t) = t + scale_shift_table` → `(scale, shift)`;
+    /// `Linear((1+scale)·RMSNorm(x) + shift)`.
+    fn final_layer(&self, x: &Array, t: &Array) -> Result<Array> {
+        let m = mlx_rs::ops::add(t, &self.final_sstable)?; // [b, 2, hidden] (t broadcasts 1→2)
+        let parts = split(&m, 2, 1)?;
+        let (scale, shift) = (&parts[0], &parts[1]); // each [b, 1, hidden]
+        let normed = mlx_rs::ops::add(
+            &multiply(
+                &self.final_norm.forward(x)?,
+                &mlx_rs::ops::add(scale, Array::from_f32(1.0))?,
+            )?,
+            shift,
+        )?;
+        self.final_linear.forward(&normed)
+    }
+
+    /// Quantize the DiT's Linear projections — the attn/FFN of every single-stream and text-fusion
+    /// block (the 256 targets [`crate::convert::transformer_quant_targets`] packs). The embedders,
+    /// `time_mod_proj`, `txt_in`, `projector`, and `final_layer` stay dense, matching the converter.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        if let Some(stream) = self.block_stream.as_mut() {
+            stream.set_quant_bits(bits);
+        }
+        self.text_fusion.quantize(bits)?;
+        for b in &mut self.blocks {
+            b.quantize(bits)?;
+        }
+        Ok(())
+    }
+
+    /// Clear **every** adapter stack on the DiT — the global projections, the single-stream blocks, and
+    /// the text-fusion aggregator — back to the bare frozen base (epic 13879, sc-13884). The forward-time
+    /// counterpart to a `set_adapters(vec![])` per module, used by the multi-phase driver to reset before
+    /// re-installing a phase's adapters (a base-only phase is exactly this reset with nothing re-applied).
+    /// Leaves the base weights (dense or packed) untouched — only the low-rank residual stacks are
+    /// dropped, so it is the exact inverse of a low-rank `apply_adapters_strict` install (a `.diff`
+    /// diff-patch, which mutates the dense base, is NOT installed on the multi-phase swap path, so this
+    /// stays a faithful reset there).
+    pub fn clear_adapters(&mut self) {
+        // The global projections are reachable via `adaptable_mut` but excluded from `adaptable_paths`
+        // (they are not part of the default training surface), so clear them explicitly.
+        self.img_in.set_adapters(Vec::new());
+        self.time_embed_l1.set_adapters(Vec::new());
+        self.time_embed_l2.set_adapters(Vec::new());
+        self.time_mod_proj.set_adapters(Vec::new());
+        self.txt_in_l1.set_adapters(Vec::new());
+        self.txt_in_l2.set_adapters(Vec::new());
+        self.final_linear.set_adapters(Vec::new());
+        // The per-block + text-fusion targets, via the enumerated adapter paths (each resolves through
+        // `adaptable_mut`, per the `AdaptableHost` contract). `adaptable_paths` borrows `&self` and
+        // returns owned strings, so the subsequent `&mut self` resolves are unencumbered.
+        for path in self.adaptable_paths() {
+            let parts: Vec<&str> = path.split('.').collect();
+            if let Some(linear) = self.adaptable_mut(&parts) {
+                linear.set_adapters(Vec::new());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn executable_test_fixture(
+    materializations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<Krea2Transformer> {
+    let mut cfg = Krea2Config::turbo();
+    cfg.hidden_size = 8;
+    cfg.num_attention_heads = 1;
+    cfg.num_kv_heads = 1;
+    cfg.attention_head_dim = 8;
+    cfg.num_layers = 2;
+    cfg.intermediate_size = 16;
+    cfg.axes_dims_rope = [2, 2, 4];
+    cfg.timestep_embed_dim = 8;
+    cfg.num_text_layers = 1;
+    cfg.num_layerwise_text_blocks = 0;
+    cfg.num_refiner_text_blocks = 0;
+    cfg.text_hidden_dim = 8;
+    cfg.text_intermediate_size = 16;
+    cfg.text_num_attention_heads = 1;
+    cfg.text_num_kv_heads = 1;
+
+    let mut weights = Weights::empty();
+    let values = |len: usize, seed: usize| -> Vec<f32> {
+        (0..len)
+            .map(|index| (((index + seed) % 19) as f32 - 9.0) * 0.0075)
+            .collect()
+    };
+    {
+        let mut linear = |base: &str, out: i32, input: i32, bias: bool, seed: usize| {
+            weights.insert(
+                format!("{base}.weight"),
+                Array::from_slice(&values((out * input) as usize, seed), &[out, input]),
+            );
+            if bias {
+                weights.insert(
+                    format!("{base}.bias"),
+                    Array::from_slice(&values(out as usize, seed + 3), &[out]),
+                );
+            }
+        };
+        linear("img_in", 8, 64, true, 1);
+        linear("time_embed.linear_1", 8, 8, true, 2);
+        linear("time_embed.linear_2", 8, 8, true, 3);
+        linear("time_mod_proj", 48, 8, true, 4);
+        linear("txt_in.linear_1", 8, 8, true, 5);
+        linear("txt_in.linear_2", 8, 8, true, 6);
+        linear("final_layer.linear", 64, 8, true, 7);
+        linear("text_fusion.projector", 1, 1, false, 8);
+    }
+    for key in ["txt_in.norm.weight", "final_layer.norm.weight"] {
+        weights.insert(key, Array::from_slice(&[0.0_f32; 8], &[8]));
+    }
+    weights.insert(
+        "final_layer.scale_shift_table",
+        Array::from_slice(&values(16, 9), &[2, 8]),
+    );
+
+    for block in 0..cfg.num_layers {
+        let prefix = format!("transformer_blocks.{block}");
+        weights.insert(
+            format!("{prefix}.scale_shift_table"),
+            Array::from_slice(&values(48, 10 + block), &[6, 8]),
+        );
+        for key in ["norm1.weight", "norm2.weight"] {
+            weights.insert(
+                format!("{prefix}.{key}"),
+                Array::from_slice(&[0.0_f32; 8], &[8]),
+            );
+        }
+        for key in ["attn.norm_q.weight", "attn.norm_k.weight"] {
+            weights.insert(
+                format!("{prefix}.{key}"),
+                Array::from_slice(&[0.0_f32; 8], &[8]),
+            );
+        }
+        for (name, out, input, seed) in [
+            ("attn.to_q", 8, 8, 20),
+            ("attn.to_k", 8, 8, 21),
+            ("attn.to_v", 8, 8, 22),
+            ("attn.to_gate", 8, 8, 23),
+            ("attn.to_out.0", 8, 8, 24),
+            ("ff.gate", 16, 8, 25),
+            ("ff.up", 16, 8, 26),
+            ("ff.down", 8, 16, 27),
+        ] {
+            weights.insert(
+                format!("{prefix}.{name}.weight"),
+                Array::from_slice(&values((out * input) as usize, seed + block), &[out, input]),
+            );
+        }
+    }
+
+    Ok(Krea2Transformer::from_weights(&weights, &cfg)?.with_test_block_stream(materializations))
+}
+
+fn run_paired_range<S, B>(
+    mut states: (S, S),
+    range: std::ops::Range<usize>,
+    mut materialize: impl FnMut(usize) -> Result<B>,
+    mut apply_positive: impl FnMut(&B, S) -> Result<S>,
+    mut apply_negative: impl FnMut(&B, S) -> Result<S>,
+) -> Result<(S, S)> {
+    for index in range {
+        let block = materialize(index)?;
+        states.0 = apply_positive(&block, states.0)?;
+        states.1 = apply_negative(&block, states.1)?;
+    }
+    Ok(states)
+}
+
+/// The embed/fuse preamble outputs shared by the dense and checkpointed forwards: the joint hidden
+/// state, the timestep embedding `t`, the shared modulation `tvec`, the joint RoPE tables, and the
+/// patchify/slice geometry the final layer needs.
+///
+/// `pub(crate)` (with `pub(crate)` fields) so the pose-control branch (sc-8465, [`crate::control`]) can
+/// run the frozen block stack itself — injecting a residual before selected blocks — instead of the
+/// straight-through [`Krea2Transformer::forward_prepared`] loop.
+pub(crate) struct JointInputs {
+    pub(crate) combined: Array,
+    pub(crate) t: Array,
+    pub(crate) tvec: Array,
+    pub(crate) rcos: Array,
+    pub(crate) rsin: Array,
+    pub(crate) cap_len: i32,
+    pub(crate) ht: i32,
+    pub(crate) wt: i32,
+    pub(crate) latent_ch: i32,
+    pub(crate) p: i32,
+}
+
+/// The **step-invariant** conditioning built once per denoise ([`Krea2Transformer::prepare`]): the
+/// fused + projected text stream (`ctx`), the joint RoPE tables, and the patchify/slice geometry.
+/// None of it depends on the noise-latent values or the timestep, so it is reused across every step
+/// (F-079).
+pub struct JointPrep {
+    ctx: Array,
+    rcos: Array,
+    rsin: Array,
+    cap_len: i32,
+    ht: i32,
+    wt: i32,
+    latent_ch: i32,
+    p: i32,
+}
+
+/// The **step-invariant** conditioning for a Kontext-style edit forward ([`Krea2Transformer::prepare_edit`]):
+/// the fused text stream (`ctx`), the CLEAN in-context reference tokens (`ref_tokens`, `None` when there
+/// are no references — then the edit forward reduces to plain text-to-image), the joint RoPE tables laid
+/// out `[text ; refs ; target]`, the target patchify/slice geometry, and `n_refs` (how many reference
+/// grids precede the noise tokens, so [`Krea2Transformer::forward_prepared_edit`] can slice the target
+/// tail). Reused across every denoise step (F-079).
+pub struct EditPrep {
+    ctx: Array,
+    ref_tokens: Option<Array>,
+    rcos: Array,
+    rsin: Array,
+    cap_len: i32,
+    ht: i32,
+    wt: i32,
+    latent_ch: i32,
+    p: i32,
+    n_refs: i32,
+}
+
+/// LoRA/LoKr target routing for the Krea single-stream DiT (sc-7577 trainer / sc-7578 inference apply):
+/// the per-block attention + FFN of the `transformer_blocks` and the `text_fusion` aggregator, plus the
+/// global projections (`img_in`, `txt_in.linear_{1,2}`, `time_embed.linear_{1,2}`, `time_mod_proj`,
+/// `final_layer.linear`). Adapter files address modules by their diffusers (trained-file) path; this
+/// routes those paths to the module tree. The default training target set is the single-stream block
+/// attention (`to_q`/`to_k`/`to_v`/`to_out.0`).
+///
+/// Both dialects resolve: the diffusers names our converter/trainer emit AND the native-mmdit names
+/// ai-toolkit (ostris) keys its LoRAs to — `blocks`/`txtfusion`/`wq`…/`mlp` for the block stack
+/// (sc-8185) and `first`/`tmlp.{0,2}`/`tproj.1`/`txtmlp.{1,3}`/`last.linear` for the global projections
+/// (sc-14163). The turbo LoRA (epic 13879) targets the globals in the native dialect.
+impl AdaptableHost for Krea2Transformer {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            // `transformer_blocks` is the diffusers name our own converter/trainer emit; `blocks` is
+            // the native Krea-2 checkpoint name that ai-toolkit (ostris) keys its LoRAs to (sc-8185).
+            ["transformer_blocks" | "blocks", n, rest @ ..] => self
+                .blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            // `text_fusion` (diffusers) ≡ `txtfusion` (native ai-toolkit) (sc-8185).
+            ["text_fusion" | "txtfusion", rest @ ..] => self.text_fusion.adaptable_mut(rest),
+            // The global/head/embed projections carry BOTH the diffusers names our converter/trainer
+            // emit AND the native-mmdit names ai-toolkit (ostris) keys its LoRAs to — the
+            // global-projection twin of the block/txtfusion aliases above (sc-14163, previously only
+            // the block dialect was aliased). The native↔diffusers correspondence is this crate's own
+            // `native_remap` map at the module-path level (i.e. minus the `.weight`/`.bias` leaf):
+            // `first`→`img_in`, `tmlp.{0,2}`→`time_embed.linear_{1,2}`, `tproj.1`→`time_mod_proj`,
+            // `txtmlp.{1,3}`→`txt_in.linear_{1,2}`, `last.linear`→`final_layer.linear`. The epic-13879
+            // turbo LoRA targets these 7 in the native dialect (carrying both low-rank + `.diff_b`
+            // deltas); without the aliases the strict apply cannot resolve them and fails the LoRA load.
+            ["img_in"] | ["first"] => Some(&mut self.img_in),
+            ["txt_in", "linear_1"] | ["txtmlp", "1"] => Some(&mut self.txt_in_l1),
+            ["txt_in", "linear_2"] | ["txtmlp", "3"] => Some(&mut self.txt_in_l2),
+            ["time_embed", "linear_1"] | ["tmlp", "0"] => Some(&mut self.time_embed_l1),
+            ["time_embed", "linear_2"] | ["tmlp", "2"] => Some(&mut self.time_embed_l2),
+            ["time_mod_proj"] | ["tproj", "1"] => Some(&mut self.time_mod_proj),
+            ["final_layer", "linear"] | ["last", "linear"] => Some(&mut self.final_linear),
+            _ => None,
+        }
+    }
+
+    /// Enumerate the per-block adapter targets (single-stream `transformer_blocks` + the `text_fusion`
+    /// aggregator). The global projections stay reachable via [`adaptable_mut`](Self::adaptable_mut)
+    /// but are excluded here — they are not part of the default training surface, and the suffix-match
+    /// the trainer applies (`to_q`/…) would not select them anyway.
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, b) in self.blocks.iter().enumerate() {
+            out.extend(prefixed_paths(&format!("transformer_blocks.{i}"), b));
+        }
+        out.extend(prefixed_paths("text_fusion", &self.text_fusion));
+        out
+    }
+}
+
+// ── Shared helpers ──────────────────────────────────────────────────────────────────────────
+
+/// Join a module prefix with a leaf name, tolerating an empty prefix.
+pub(crate) fn join(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}.{name}")
+    }
+}
+
+/// Split `[b, L, ...]` at the sequence-axis (axis 1) boundary `at`, returning `[x[..at], x[at..]]` —
+/// a contiguous split (`split_axis`), not an arange-gather (F-114). `at` must satisfy `0 ≤ at ≤ L`.
+pub(crate) fn split_axis1(x: &Array, at: i32) -> Result<Vec<Array>> {
+    Ok(x.split_axis(&[at], 1)?)
+}
+
+// F-078: the GQA kv-head expansion was open-coded identically here and in the two Qwen3-VL text
+// encoders; re-export the shared `mlx_gen::nn::repeat_kv` (byte-identical `repeat_interleave` over
+// the head axis, matching the reference's `enable_gqa`).
+pub(crate) use mlx_gen::nn::repeat_kv;
+
+/// Reference `temb`: `freqs = exp(−ln(1e4)·arange(half)/half)`, `args = (timestep·1e3)·freqs`,
+/// `concat([cos, sin], −1)` (cos-first). `timestep`: `[b]` → `[b, 1, dim]` (a per-sample vector that
+/// broadcasts over the sequence). Built in f32 (the reference upcasts).
+fn temb(timestep: &Array, dim: i32) -> Result<Array> {
+    let half = dim / 2;
+    let arange: Vec<f32> = (0..half).map(|i| i as f32).collect();
+    let arange = Array::from_slice(&arange, &[half]);
+    let neg_ln = -(10000f64.ln()) as f32;
+    let exponent = divide(&multiply(&arange, scalar(neg_ln))?, scalar(half as f32))?;
+    let freqs = exp(&exponent)?; // [half]
+
+    let t = timestep.as_dtype(Dtype::Float32)?;
+    let b = t.shape()[0];
+    let scaled = multiply(&t.reshape(&[b, 1, 1])?, scalar(1000.0))?; // [b, 1, 1]
+    let args = multiply(&scaled, &freqs)?; // [b, 1, half]
+    Ok(concatenate_axis(&[&cos(&args)?, &sin(&args)?], -1)?) // [b, 1, dim]
+}
+
+/// Reference `rearrange("b c (h ph) (w pw) -> b (h w) (c ph pw)")`: `[b, C, H, W] →
+/// [b, (H/p)(W/p), C·p·p]` with **channel-major** patch flattening (NOT boogu's `(ph pw c)`).
+fn patchify(latent: &Array, p: i32) -> Result<Array> {
+    let sh = latent.shape();
+    let (b, c, h, w) = (sh[0], sh[1], sh[2], sh[3]);
+    let (ht, wt) = (h / p, w / p);
+    let x = latent.reshape(&[b, c, ht, p, wt, p])?; // b, c, ht, ph, wt, pw
+    let x = x.transpose_axes(&[0, 2, 4, 1, 3, 5])?; // b, ht, wt, c, ph, pw
+    Ok(x.reshape(&[b, ht * wt, c * p * p])?)
+}
+
+/// Inverse of [`patchify`] (`"b (h w) (c ph pw) -> b c (h ph) (w pw)"`): `[b, (h)(w), C·p·p] →
+/// [b, C, h·p, w·p]`.
+fn unpatchify(tokens: &Array, ht: i32, wt: i32, p: i32, c: i32) -> Result<Array> {
+    let b = tokens.shape()[0];
+    let x = tokens.reshape(&[b, ht, wt, c, p, p])?; // b, ht, wt, c, ph, pw
+    let x = x.transpose_axes(&[0, 3, 1, 4, 2, 5])?; // b, c, ht, ph, wt, pw
+    Ok(x.reshape(&[b, c, ht * p, wt * p])?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn assert_exact(left: &Array, right: &Array) {
+        mlx_rs::transforms::eval([left, right]).unwrap();
+        assert_eq!(left.as_slice::<f32>(), right.as_slice::<f32>());
+    }
+
+    #[test]
+    fn actual_prepared_entrypoints_preserve_cfg_order_parity_and_materialization_counts() {
+        let materializations = Arc::new(AtomicUsize::new(0));
+        let transformer = executable_test_fixture(Arc::clone(&materializations)).unwrap();
+        let latent = Array::from_slice(
+            &(0..64)
+                .map(|index| index as f32 * 0.01 - 0.3)
+                .collect::<Vec<_>>(),
+            &[1, 16, 2, 2],
+        );
+        let timestep = Array::from_slice(&[0.37_f32], &[1]);
+        let positive_context = Array::from_slice(
+            &(0..16)
+                .map(|index| index as f32 * 0.025 - 0.2)
+                .collect::<Vec<_>>(),
+            &[1, 2, 1, 8],
+        );
+        let negative_context = Array::from_slice(
+            &(0..8)
+                .map(|index| 0.4 - index as f32 * 0.03)
+                .collect::<Vec<_>>(),
+            &[1, 1, 1, 8],
+        );
+        let positive = transformer
+            .prepare(&positive_context, None, &latent)
+            .unwrap();
+        let negative = transformer
+            .prepare(&negative_context, None, &latent)
+            .unwrap();
+        let expected_positive = transformer
+            .forward_prepared_windowed(&latent, &timestep, &positive, None)
+            .unwrap();
+        let expected_negative = transformer
+            .forward_prepared_windowed(&latent, &timestep, &negative, None)
+            .unwrap();
+        mlx_rs::transforms::eval([&expected_positive, &expected_negative]).unwrap();
+        assert_ne!(
+            expected_positive.as_slice::<f32>(),
+            expected_negative.as_slice::<f32>(),
+            "the fixture must distinguish positive and negative routing"
+        );
+
+        let (resident_positive, resident_negative) = transformer
+            .forward_prepared_pair_windowed(&latent, &timestep, &positive, &negative, None)
+            .unwrap();
+        assert_exact(&resident_positive, &expected_positive);
+        assert_exact(&resident_negative, &expected_negative);
+        assert_eq!(materializations.load(Ordering::Relaxed), 0);
+
+        let attention = mlx_gen::attention::AttentionPlan::budgeted(
+            mlx_gen::attention::AttentionBudget::from_score_elements(1, false),
+        );
+        let bounded_positive = transformer
+            .forward_prepared_windowed_budgeted(&latent, &timestep, &positive, None, attention)
+            .unwrap();
+        mlx_rs::transforms::eval([&bounded_positive, &expected_positive]).unwrap();
+        let expected = expected_positive.as_slice::<f32>();
+        let bounded = bounded_positive.as_slice::<f32>();
+        let peak = expected
+            .iter()
+            .fold(0.0_f32, |value, item| value.max(item.abs()))
+            .max(1e-12);
+        let delta = expected
+            .iter()
+            .zip(bounded)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max)
+            / peak;
+        assert!(
+            delta <= 2e-3,
+            "bounded Krea attention changed the prepared DiT output: peak-relative delta {delta:e}"
+        );
+        let cancelled = mlx_gen::CancelFlag::new();
+        cancelled.cancel();
+        let result = transformer.forward_prepared_windowed_budgeted(
+            &latent,
+            &timestep,
+            &positive,
+            None,
+            attention.with_cancel(&cancelled),
+        );
+        assert!(
+            matches!(result, Err(mlx_gen::Error::Canceled)),
+            "a pre-cancelled bounded plan must cross a physical query-chunk boundary"
+        );
+
+        materializations.store(0, Ordering::Relaxed);
+        let cancel = mlx_gen::CancelFlag::new();
+        let window = transformer.block_window(Some(1), &cancel).unwrap();
+        let (windowed_positive, windowed_negative) = transformer
+            .forward_prepared_pair_windowed(&latent, &timestep, &positive, &negative, window)
+            .unwrap();
+        assert_exact(&windowed_positive, &expected_positive);
+        assert_exact(&windowed_negative, &expected_negative);
+        assert_eq!(
+            materializations.load(Ordering::Relaxed),
+            transformer.num_blocks(),
+            "paired CFG must materialize each block once"
+        );
+
+        materializations.store(0, Ordering::Relaxed);
+        let single = transformer
+            .forward_prepared_windowed(&latent, &timestep, &positive, window)
+            .unwrap();
+        assert_exact(&single, &expected_positive);
+        assert_eq!(
+            materializations.load(Ordering::Relaxed),
+            transformer.num_blocks(),
+            "the non-CFG path must retain one traversal"
+        );
+
+        let reference = Array::from_slice(
+            &(0..64)
+                .map(|index| 0.15 - index as f32 * 0.004)
+                .collect::<Vec<_>>(),
+            &[1, 16, 2, 2],
+        );
+        let edit_positive = transformer
+            .prepare_edit(
+                &positive_context,
+                None,
+                &latent,
+                std::slice::from_ref(&reference),
+            )
+            .unwrap();
+        let edit_negative = transformer
+            .prepare_edit(&negative_context, None, &latent, &[reference])
+            .unwrap();
+        let expected_edit_positive = transformer
+            .forward_prepared_edit_windowed(&latent, &timestep, &edit_positive, None)
+            .unwrap();
+        let expected_edit_negative = transformer
+            .forward_prepared_edit_windowed(&latent, &timestep, &edit_negative, None)
+            .unwrap();
+        let (resident_edit_positive, resident_edit_negative) = transformer
+            .forward_prepared_edit_pair_windowed(
+                &latent,
+                &timestep,
+                &edit_positive,
+                &edit_negative,
+                None,
+            )
+            .unwrap();
+        assert_exact(&resident_edit_positive, &expected_edit_positive);
+        assert_exact(&resident_edit_negative, &expected_edit_negative);
+
+        materializations.store(0, Ordering::Relaxed);
+        let (windowed_edit_positive, windowed_edit_negative) = transformer
+            .forward_prepared_edit_pair_windowed(
+                &latent,
+                &timestep,
+                &edit_positive,
+                &edit_negative,
+                window,
+            )
+            .unwrap();
+        assert_exact(&windowed_edit_positive, &expected_edit_positive);
+        assert_exact(&windowed_edit_negative, &expected_edit_negative);
+        assert_eq!(
+            materializations.load(Ordering::Relaxed),
+            transformer.num_blocks()
+        );
+
+        materializations.store(0, Ordering::Relaxed);
+        let single_edit = transformer
+            .forward_prepared_edit_windowed(&latent, &timestep, &edit_positive, window)
+            .unwrap();
+        assert_exact(&single_edit, &expected_edit_positive);
+        assert_eq!(
+            materializations.load(Ordering::Relaxed),
+            transformer.num_blocks()
+        );
+    }
+
+    #[test]
+    fn paired_range_matches_two_legacy_states_and_materializes_each_block_once() {
+        let blocks = [2_i32, 3, 5];
+        let legacy_materializations = Cell::new(0usize);
+        let legacy = |mut state: i32| {
+            for block in blocks {
+                legacy_materializations.set(legacy_materializations.get() + 1);
+                state = state * block + 1;
+            }
+            state
+        };
+        let expected = (legacy(1), legacy(7));
+
+        let paired_materializations = Cell::new(0usize);
+        let actual = run_paired_range(
+            (1_i32, 7_i32),
+            0..blocks.len(),
+            |index| {
+                paired_materializations.set(paired_materializations.get() + 1);
+                Ok(blocks[index])
+            },
+            |block, state| Ok(state * block + 1),
+            |block, state| Ok(state * block + 1),
+        )
+        .unwrap();
+
+        assert_eq!(
+            actual, expected,
+            "paired traversal must preserve both outputs"
+        );
+        assert_eq!(legacy_materializations.get(), blocks.len() * 2);
+        assert_eq!(paired_materializations.get(), blocks.len());
+    }
+
+    #[test]
+    fn paired_carry_preserves_typed_cancellation_at_window_boundaries() {
+        let cancel = mlx_gen::CancelFlag::new();
+        let opened = Cell::new(0usize);
+        let materialized_blocks = Cell::new(0usize);
+        let error = mlx_gen::block_residency::run_windowed(
+            &mlx_gen::block_residency::BlockPlan::new(4, 2).unwrap(),
+            &cancel,
+            (0usize, 10usize),
+            || {
+                opened.set(opened.get() + 1);
+                Ok(Weights::empty())
+            },
+            |states, _view, range| {
+                run_paired_range(
+                    states,
+                    range,
+                    |index| {
+                        materialized_blocks.set(materialized_blocks.get() + 1);
+                        Ok(index)
+                    },
+                    |block, state| Ok(state + block + 1),
+                    |block, state| Ok(state + block + 1),
+                )
+            },
+            |_| {
+                cancel.cancel();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, mlx_gen::Error::Canceled));
+        assert_eq!(opened.get(), 1, "cancellation must prevent the next window");
+        assert_eq!(materialized_blocks.get(), 2);
+    }
+
+    /// A dense `[out, in]` weight (+ its `[out]` bias) at `base` — values are irrelevant (these tests
+    /// route by shape, never forward), so each global projection gets a distinct `out` we can match on.
+    fn put_lin(w: &mut Weights, base: &str, out: i32, in_: i32) {
+        w.insert(
+            format!("{base}.weight"),
+            Array::from_slice(&vec![0f32; (out * in_) as usize], &[out, in_]),
+        );
+        w.insert(
+            format!("{base}.bias"),
+            Array::from_slice(&vec![0f32; out as usize], &[out]),
+        );
+    }
+
+    /// A minimal `Krea2Transformer` (zero single-stream + text-fusion blocks) whose seven global/head/
+    /// embed projections have DISTINCT output dims, so `AdaptableLinear::base_shape()[0]` identifies
+    /// exactly which projection a target path resolved to (the sc-8185 block-alias test's precedent,
+    /// lifted to the transformer level).
+    fn tiny_transformer() -> Krea2Transformer {
+        let mut cfg = Krea2Config::turbo();
+        cfg.num_attention_heads = 2;
+        cfg.attention_head_dim = 4;
+        cfg.axes_dims_rope = [1, 1, 2];
+        cfg.hidden_size = 8;
+        cfg.num_kv_heads = 1;
+        cfg.num_layers = 0;
+        cfg.num_layerwise_text_blocks = 0;
+        cfg.num_refiner_text_blocks = 0;
+        cfg.text_num_attention_heads = 2;
+        cfg.text_hidden_dim = 8;
+        cfg.timestep_embed_dim = 4;
+        cfg.in_channels = 8;
+
+        let mut w = Weights::empty();
+        // Distinct out dims 101..=107, one per global projection.
+        put_lin(&mut w, "img_in", 101, 8);
+        put_lin(&mut w, "time_embed.linear_1", 102, 8);
+        put_lin(&mut w, "time_embed.linear_2", 103, 8);
+        put_lin(&mut w, "time_mod_proj", 104, 8);
+        put_lin(&mut w, "txt_in.linear_1", 105, 8);
+        put_lin(&mut w, "txt_in.linear_2", 106, 8);
+        put_lin(&mut w, "final_layer.linear", 107, 8);
+        // Norms + the text-fusion projector (no bias) + the final modulation table (reshapes to
+        // `[1, 2, hidden]` = 16 elements) — the remaining fields `from_weights` requires.
+        w.insert("txt_in.norm.weight", Array::from_slice(&[0f32; 8], &[8]));
+        w.insert(
+            "final_layer.norm.weight",
+            Array::from_slice(&[0f32; 8], &[8]),
+        );
+        w.insert(
+            "text_fusion.projector.weight",
+            Array::from_slice(&[0f32; 12], &[1, 12]),
+        );
+        w.insert(
+            "final_layer.scale_shift_table",
+            Array::from_slice(&[0f32; 16], &[2, 8]),
+        );
+
+        Krea2Transformer::from_weights(&w, &cfg).unwrap()
+    }
+
+    /// sc-14163: the seven native-mmdit (ai-toolkit / ostris) GLOBAL-projection target paths the turbo
+    /// LoRA (epic 13879) keys — `first`, `tmlp.0`/`tmlp.2`, `tproj.1`, `txtmlp.1`/`txtmlp.3`,
+    /// `last.linear` — must now RESOLVE via `adaptable_mut` (they returned `None` before this fix, so the
+    /// strict apply failed the whole LoRA), AND each must route to the SAME projection as its diffusers
+    /// counterpart. Distinct output dims (101..=107) prove correct routing, not just a non-`None` match.
+    #[test]
+    fn adaptable_mut_resolves_native_global_projection_aliases() {
+        // (diffusers path, native path, the projection's distinct out dim).
+        let cases: [(&[&str], &[&str], i32); 7] = [
+            (&["img_in"], &["first"], 101),
+            (&["time_embed", "linear_1"], &["tmlp", "0"], 102),
+            (&["time_embed", "linear_2"], &["tmlp", "2"], 103),
+            (&["time_mod_proj"], &["tproj", "1"], 104),
+            (&["txt_in", "linear_1"], &["txtmlp", "1"], 105),
+            (&["txt_in", "linear_2"], &["txtmlp", "3"], 106),
+            (&["final_layer", "linear"], &["last", "linear"], 107),
+        ];
+        for (diffusers, native, out) in cases {
+            let mut t = tiny_transformer();
+            // The diffusers name routes to the expected projection.
+            assert_eq!(
+                t.adaptable_mut(diffusers)
+                    .unwrap_or_else(|| panic!("diffusers path {diffusers:?} must resolve"))
+                    .base_shape()[0],
+                out,
+                "diffusers {diffusers:?} routed to the wrong projection"
+            );
+            // The native alias resolves (it did NOT before sc-14163) and routes to the SAME projection.
+            assert_eq!(
+                t.adaptable_mut(native)
+                    .unwrap_or_else(|| panic!("native path {native:?} must resolve (sc-14163)"))
+                    .base_shape()[0],
+                out,
+                "native {native:?} must route to the same projection as {diffusers:?}"
+            );
+        }
+    }
+
+    /// A native path that is NOT one of the aliased global projections still resolves to nothing — the
+    /// aliases are exact, not a blanket accept (guards against a future over-broad match arm).
+    #[test]
+    fn adaptable_mut_rejects_unknown_native_global_path() {
+        let mut t = tiny_transformer();
+        assert!(t.adaptable_mut(&["tmlp", "1"]).is_none()); // `tmlp.1` is a GELU, not a Linear
+        assert!(t.adaptable_mut(&["last", "norm"]).is_none()); // the final RMSNorm is not adaptable
+        assert!(t.adaptable_mut(&["nope"]).is_none());
+    }
+}

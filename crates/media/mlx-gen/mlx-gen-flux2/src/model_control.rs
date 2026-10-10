@@ -1,0 +1,604 @@
+//! `Flux2DevControl` — the FLUX.2-dev **Fun-Controlnet-Union** variant (sc-2292): strict-pose
+//! (VACE-style) conditioning via `alibaba-pai/FLUX.2-dev-Fun-Controlnet-Union`, registered as its
+//! own `Generator` (`flux2_dev_control`).
+//!
+//! Mirrors the Z-Image-turbo control port (sc-2257) onto the dev base: the transformer is a
+//! [`Flux2ControlTransformer`] (the parity-proven dev DiT + the control branch) and `generate`
+//! threads a VAE-encoded control context through it under the embedded-guidance denoise (dev is
+//! guidance-distilled — a single forward, no true-CFG). [`load_dev_control`] needs the dev snapshot
+//! (`spec.weights`) **and** the control checkpoint (`spec.control`); the base loads manifest-aware
+//! (a pre-quantized dev snapshot loads packed, sc-5917) and the bf16 control overlay loads dense,
+//! then `spec.quantize` packs the control branch in place (the packed base no-ops). The control
+//! patch embedder stays dense (its 260 in-features is not a multiple of the quant group size).
+//!
+//! Architecture (`videox_fun/models/flux2_transformer2d_control.py`): a VACE ControlNet on the first
+//! 4 of dev's 8 base double blocks. The control context is the VAE-encoded pose/union skeleton
+//! (`control_latents` 128) concatenated with a zero inpaint mask (4) and a zero inpaint latent (128)
+//! = 260 channels per image token (the union ControlNet's pose-only layout). See
+//! [`crate::transformer::Flux2ControlBranch`] for the hint-injection forward.
+
+use mlx_gen::image::decoded_to_image;
+use mlx_gen::tokenizer::TextTokenizer;
+use mlx_gen::{
+    curated_sampler_names, curated_scheduler_names, default_seed, gen_core, require_base_dir,
+    require_control, run_flow_sampler_with_latent_hook, Capabilities, Conditioning,
+    ConditioningKind, ControlBranch, Error, GenerationOutput, GenerationRequest, Generator, Image,
+    LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency,
+    Result, SizeFloor, TimestepConvention,
+};
+use mlx_rs::transforms::eval;
+use mlx_rs::Array;
+
+use crate::config::{Flux2Config, FLUX2_DEV_CONTROL_ID};
+use crate::model::{crop_to_even, match_latent_spatial_size, validate_request, Flux2TextOwned};
+use crate::pipeline::{
+    add_noise_by_interpolation, create_noise, fun_control_context_from_latents, init_time_step,
+    pack_latents, patchify_latents, prepare_grid_ids, prepare_text_ids, preprocess_ref_image,
+    schedule_with,
+};
+use crate::transformer::Flux2ControlTransformer;
+use crate::vae::Flux2Vae;
+use crate::{loader, CONTROL_IN_DIM};
+
+/// The control variant's identity + capabilities. The guidance-distilled dev base (embedded
+/// guidance, no negative prompt / true-CFG) plus `Control` conditioning (the required pose/union
+/// skeleton) and an optional `Reference` (an img2img init image, the fork's `inpaint_image`/`image`
+/// init seed). Mac-only, like every FLUX.2 variant.
+pub fn descriptor_dev_control() -> ModelDescriptor {
+    ModelDescriptor {
+        // Deliberately input-agnostic, not undeclared: the Fun-Controlnet-Union checkpoint runs
+        // pose / canny / depth down one VAE-encoded path with no mode index, so every kind is
+        // genuinely accepted. Declaring `Some(Any)` says that; leaving it `None` would say "nobody
+        // checked".
+        control_kinds: Some(mlx_gen::AcceptedControlKinds::Any),
+        required_components: &[],
+        id: FLUX2_DEV_CONTROL_ID,
+        family: "flux2",
+        backend: "mlx",
+        modality: Modality::Image,
+        capabilities: Capabilities {
+            supports_negative_prompt: false,
+            // dev consumes its guidance scale as an embedded scalar (FLUX.1-dev pattern), not CFG.
+            supports_guidance: true,
+            supports_true_cfg: false,
+            // Control (required, the pose/union skeleton) + an optional img2img Reference init.
+            conditioning: vec![ConditioningKind::Control, ConditioningKind::Reference],
+            // LoRA/LoKr target the base DiT (the control branch is never an adapter target).
+            supports_lora: true,
+            supports_lokr: true,
+            supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
+            // Curated unified-framework integrator menu (epic 7114 P3), as the base FLUX.2 path.
+            samplers: curated_sampler_names(),
+            // Curated scheduler menu (epic 7114), as the base FLUX.2 path — native default + curated.
+            schedulers: {
+                let mut s = curated_scheduler_names();
+                s.push("flow_match_euler");
+                s
+            },
+            supported_guidance_methods: vec![],
+            min_size: 256,
+            max_size: 2048,
+            max_count: 8,
+            mac_only: true,
+            supports_kv_cache: false,
+            requires_sigma_shift: true,
+            // Wired onto the shared `Residency` seam (sc-10840); honors Sequential offload — the
+            // Mistral-3 text encoder drops after the prompt encode, then the control transformer (dev
+            // DiT + control branch) + VAE load, bounding peak to `max(TE, DiT+control+VAE)`.
+            supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
+            supports_preview: true,
+            supports_prompt_enhancement: false,
+            supports_streaming: false,
+            supports_multi_speaker: false,
+            supports_conversation_history: false,
+            supports_conversation_session: false,
+            max_speakers: None,
+            // No audio surface (sc-12834): pure image/video model.
+            audio_sample_rates: vec![],
+            max_audio_duration_secs: None,
+            audio_voices: vec![],
+            audio_languages: vec![],
+            audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
+        },
+    }
+}
+
+/// The heavy render-phase components for the FLUX.2 control variant — the control transformer (the dev
+/// DiT plus the Fun-Controlnet-Union control branch, loaded together) and the VAE. No PiD overlay (the
+/// FLUX.2 PiD story scoped the control path out — sc-7847). Owned by the `Resident` components or by a
+/// `Sequential` generate.
+pub(crate) struct Flux2ControlHeavyOwned {
+    transformer: Flux2ControlTransformer,
+    vae: Flux2Vae,
+}
+
+/// A loaded control generator: the dev Mistral-3 text encoder + the control transformer + VAE, held via
+/// the shared [`Residency`] seam (sc-10840). `Resident` (default) keeps every component warm;
+/// `Sequential` drops the text encoder after the prompt encode, then loads the control transformer
+/// (base DiT + control branch) + VAE, bounding peak to `max(TE, DiT+control+VAE)`.
+pub struct Flux2DevControl {
+    descriptor: ModelDescriptor,
+    config: Flux2Config,
+    tokenizer: Option<TextTokenizer>,
+    residency: Residency<Flux2TextOwned, Flux2ControlHeavyOwned>,
+}
+
+/// FLUX.2-dev strict pose (sc-2292): load the dev snapshot + the Fun-Controlnet-Union control
+/// checkpoint and assemble the [`Flux2DevControl`] generator, honoring [`LoadSpec::offload_policy`]
+/// (sc-10840).
+///
+/// `spec.weights` must be the dev snapshot directory (tokenizer/ text_encoder/ transformer/ vae/);
+/// `spec.control` (required) the Fun-Controlnet-Union checkpoint (a single `.safetensors` `File`, or
+/// a `Dir`). The base loads manifest-aware (pre-quantized dev → packed); the bf16 control overlay
+/// loads dense. `spec.quantize` (Q4/Q8) then quantizes the whole model — a no-op on the already
+/// packed base, packing the dense control branch + the text encoder + VAE (the control patch
+/// embedder stays dense, its in-features is not a multiple of 64).
+pub fn load_dev_control(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    if spec.precision != Precision::Bf16 {
+        return Err(Error::Msg(format!(
+            "{FLUX2_DEV_CONTROL_ID}: only the default precision is wired; drop the precision \
+             override (Q4/Q8 = spec.quantize)"
+        )));
+    }
+    // Shared load boilerplate (sc-8241): the base must be a snapshot dir, the control checkpoint is
+    // required — checked up front (fail fast) so a missing control checkpoint errors before any
+    // component loads.
+    let root = require_base_dir(
+        spec,
+        FLUX2_DEV_CONTROL_ID,
+        "a FLUX.2-dev snapshot directory",
+    )?;
+    require_control(
+        spec,
+        FLUX2_DEV_CONTROL_ID,
+        "FLUX.2-dev-Fun-Controlnet-Union",
+    )?;
+    // F-181: a `Sequential` + `spec.quantize` load over a dense snapshot re-quantizes every generate.
+    if let Some(q) = spec.quantize {
+        if matches!(spec.offload_policy, OffloadPolicy::Sequential) {
+            mlx_gen::residency::warn_sequential_requantize(FLUX2_DEV_CONTROL_ID, q.bits());
+        }
+    }
+    Ok(Box::new(Flux2DevControl {
+        descriptor: descriptor_dev_control(),
+        config: Flux2Config::dev(),
+        tokenizer: Some(loader::load_tokenizer_dev(root)?),
+        residency: build_control_residency(spec)?,
+    }))
+}
+
+/// The policy→[`Residency`] dispatch for the FLUX.2 control variant (sc-10840). `Resident` eager-loads
+/// the text encoder + control heavy bundle now; `Sequential` captures the two per-phase loaders and
+/// loads nothing now. The text phase is the dev Mistral-3 encoder only (no caption upsample — the
+/// control variant has no vision tower), reusing the shared [`Flux2TextOwned`]; the heavy loader builds
+/// the control transformer (base + control branch) + VAE.
+fn build_control_residency(
+    spec: &LoadSpec,
+) -> Result<Residency<Flux2TextOwned, Flux2ControlHeavyOwned>> {
+    let spec_text = spec.clone();
+    let spec_heavy = spec.clone();
+    Residency::from_policy(
+        spec.offload_policy,
+        move || load_control_text(&spec_text),
+        // The control variant has no PiD overlay, so the heavy loader ignores `use_pid`.
+        move |_use_pid| load_control_heavy(&spec_heavy),
+    )
+}
+
+/// Load the dev Mistral-3 text encoder (+ optional Q4/Q8) — the phase-A component dropped first under
+/// `Sequential`. No vision tower / projector (the control variant does not caption-upsample), so it
+/// wraps the encoder in a text-only [`Flux2TextOwned`].
+fn load_control_text(spec: &LoadSpec) -> Result<Flux2TextOwned> {
+    let root = require_base_dir(
+        spec,
+        FLUX2_DEV_CONTROL_ID,
+        "a FLUX.2-dev snapshot directory",
+    )?;
+    let mut text_encoder = loader::load_text_encoder_dev(root)?;
+    if let Some(q) = spec.quantize {
+        text_encoder.quantize(q.bits())?;
+    }
+    Ok(Flux2TextOwned {
+        text_encoder,
+        vision_tower: None,
+        projector: None,
+    })
+}
+
+/// Load the control heavy bundle — the control transformer (dev DiT + the Fun-Controlnet-Union control
+/// branch, from `spec.control`) and the VAE (+ Q4/Q8 + LoRA/LoKr residuals on the base DiT) — everything
+/// but the text encoder. The control branch loads here with the DiT (the heavy phase), not the
+/// text-encoder phase. Byte-identical to the pre-seam composition.
+fn load_control_heavy(spec: &LoadSpec) -> Result<Flux2ControlHeavyOwned> {
+    let root = require_base_dir(
+        spec,
+        FLUX2_DEV_CONTROL_ID,
+        "a FLUX.2-dev snapshot directory",
+    )?;
+    let control = require_control(
+        spec,
+        FLUX2_DEV_CONTROL_ID,
+        "FLUX.2-dev-Fun-Controlnet-Union",
+    )?;
+    let mut transformer = loader::load_control_transformer_dev(root, control)?;
+    let mut vae = loader::load_vae(root)?;
+    if let Some(q) = spec.quantize {
+        let bits = q.bits();
+        transformer.quantize(bits)?;
+        vae.quantize(bits)?;
+    }
+    // LoRA/LoKr (sc-2646): applied to the base DiT (the control branch is never an adapter target),
+    // after quantization, as forward-time residuals. No-op when empty.
+    if !spec.adapters.is_empty() {
+        crate::adapters::apply_flux2_adapters(transformer.base_mut(), &spec.adapters)?;
+    }
+    Ok(Flux2ControlHeavyOwned { transformer, vae })
+}
+
+impl Flux2DevControl {
+    /// Tokenize + encode the prompt into `(prompt_embeds, text_ids)` (the dev Mistral TE path; same
+    /// as [`crate::model::Flux2`]'s `encode`). Takes the encoder as an argument so the residency seam's
+    /// phase-A closure supplies either the warm-resident or the just-loaded `Sequential` encoder.
+    fn encode(
+        tokenizer: &TextTokenizer,
+        text: &Flux2TextOwned,
+        prompt: &str,
+    ) -> Result<(Array, Array)> {
+        let tok = tokenizer.tokenize(prompt)?;
+        let (input_ids, attention_mask) = mlx_gen::tokenizer::to_arrays(&tok);
+        let embeds = text
+            .text_encoder
+            .prompt_embeds(&input_ids, &attention_mask)?;
+        let ids = prepare_text_ids(embeds.shape()[1] as usize);
+        Ok((embeds, ids))
+    }
+
+    /// The optional img2img init image (a single `Reference`) + its strength (the per-reference
+    /// strength wins over `req.strength`). More than one `Reference` is an error.
+    fn resolve_reference<'a>(
+        &self,
+        req: &'a GenerationRequest,
+    ) -> Result<Option<(&'a Image, Option<f32>)>> {
+        let mut reference = None;
+        for c in &req.conditioning {
+            if let Conditioning::Reference { image, strength } = c {
+                if reference.is_some() {
+                    return Err(Error::Msg(format!(
+                        "{FLUX2_DEV_CONTROL_ID}: a single img2img init reference is supported"
+                    )));
+                }
+                reference = Some((image, strength.or(req.strength)));
+            }
+        }
+        Ok(reference)
+    }
+
+    /// img2img init conditioning (same encode chain as [`crate::model::Flux2`]): resize → VAE-encode
+    /// → NCHW → crop-to-even → match the target latent grid → 2×2 patchify → BN-normalize → pack.
+    /// Returns the **clean** packed init latents `[1, lat_h·lat_w, 128]` (seed-independent).
+    fn encode_init_latents(
+        vae: &Flux2Vae,
+        image: &Image,
+        width: u32,
+        height: u32,
+    ) -> Result<Array> {
+        let pre = preprocess_ref_image(image, width, height)?;
+        let enc = vae.encode_mean(&pre)?;
+        let enc = enc.transpose_axes(&[0, 3, 1, 2])?;
+        let enc = crop_to_even(&enc)?;
+        let enc = match_latent_spatial_size(&enc, (height / 8) as i32, (width / 8) as i32)?;
+        let patchified = patchify_latents(&enc)?;
+        let normed = vae.bn_normalize_nchw(&patchified)?;
+        pack_latents(&normed)
+    }
+
+    /// Build the packed control context `[1, seq, 260]` from the pose/union control image — the
+    /// fork's `pipeline_flux2_control.py`: VAE-encode → 2×2 patchify → BN-normalize → pack
+    /// (`control_latents`, 128), concatenated with a zero inpaint **mask** (4) and a zero **inpaint
+    /// latent** (128). For pure pose (no inpaint image / mask) the fork's mask is `1 − ones = 0` and
+    /// the inpaint latent is a zeros tensor, so both are all-zero here. `seq` equals the target
+    /// latent sequence (built at the same `width`/`height`), so the control context aligns 1:1 with
+    /// the base image tokens.
+    fn encode_control_context(
+        &self,
+        vae: &Flux2Vae,
+        image: &Image,
+        width: u32,
+        height: u32,
+    ) -> Result<Array> {
+        let pre = preprocess_ref_image(image, width, height)?;
+        let enc = vae.encode_mean(&pre)?; // NHWC [1,H/8,W/8,32]
+        let enc = enc.transpose_axes(&[0, 3, 1, 2])?; // NCHW
+        let enc = crop_to_even(&enc)?;
+        let enc = match_latent_spatial_size(&enc, (height / 8) as i32, (width / 8) as i32)?;
+        let patchified = patchify_latents(&enc)?; // [1,128,h,w]
+        let control_lat = vae.bn_normalize_nchw(&patchified)?;
+        // Union pose-only layout: pack the control latent → [1, seq, 128], then concat a zero mask
+        // (1 latent channel × 2×2 patch = 4) + zero inpaint latent (= in_channels, 128) on the packed
+        // feature axis → 260 = CONTROL_IN_DIM. The pack + channel-fill is `fun_control_context_from_latents`
+        // (byte-golden'd against the fork's `pipeline_flux2_control` in `tests/fun_control_parity.rs`).
+        let in_ch = self.config.in_channels as i32;
+        let num_latent_channels = self.config.num_latent_channels as i32;
+        let cc = fun_control_context_from_latents(&control_lat, in_ch, num_latent_channels)?;
+        debug_assert_eq!(
+            cc.shape()[2],
+            CONTROL_IN_DIM,
+            "control context must be 260ch"
+        );
+        Ok(cc)
+    }
+
+    fn generate_impl(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        self.validate(req)?;
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::Msg(format!("{FLUX2_DEV_CONTROL_ID}: model is not loaded")))?;
+        // F-037: bail before the TE encode + the control-context / img2img VAE encodes (all pre-denoise).
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let base_seed = req.seed.unwrap_or_else(default_seed);
+        let steps = req.steps.unwrap_or(self.config_default_steps()) as usize;
+        let guidance = req.guidance.unwrap_or(crate::config::DEFAULT_GUIDANCE_DEV);
+        // dev is guidance-distilled: the scale is an embedded scalar (single forward), never true-CFG.
+        let embedded_guidance = Some(guidance);
+
+        // `resolve_control` is cheap (reads `req.conditioning`), so resolve it before the residency
+        // seam runs; the control-context VAE-encode happens in the heavy phase.
+        let (control_image, control_scale) = self.resolve_control(req)?;
+        // Optional img2img init (the fork's `image`/`inpaint_image` seed) via a single `Reference`.
+        let img2img = self.resolve_reference(req)?;
+        let start_step = match &img2img {
+            Some((_, strength)) => init_time_step(steps, *strength),
+            None => 0,
+        };
+
+        let sched = schedule_with(steps, req.width, req.height, req.scheduler.as_deref())?;
+        let lat_h = (req.height / 16) as usize;
+        let lat_w = (req.width / 16) as usize;
+        let latent_ids = prepare_grid_ids(lat_h, lat_w, 0);
+        let in_channels = self.config.in_channels as i32;
+
+        // Staged residency lifecycle (sc-10840): under `Sequential` the seam loads the Mistral-3
+        // encoder, encodes the prompt, materializes, then DROPS it + `clear_cache()` before the control
+        // transformer + VAE load. The control-context + img2img-init VAE-encodes run in the heavy phase
+        // (byte-identical — deterministic, TE-independent encodes).
+        self.residency.run(
+            &req.cancel,
+            // The control variant has no PiD overlay; `use_pid` is inert for the heavy loader.
+            req.use_pid,
+            on_progress,
+            |text: &Flux2TextOwned| Self::encode(tokenizer, text, &req.prompt),
+            |encoded| {
+                let Some((prompt_embeds, _text_ids)) = encoded else {
+                    return Ok(());
+                };
+                eval([prompt_embeds])?;
+                Ok(())
+            },
+            |heavy, (prompt_embeds, text_ids), on_progress| {
+                let vae = &heavy.vae;
+                // The control context + the clean img2img init latents are constant across steps + the
+                // batch (they depend only on the image + dims, not the per-seed noise) — encode once.
+                let control_context =
+                    self.encode_control_context(vae, control_image, req.width, req.height)?;
+                let clean_init = match &img2img {
+                    Some((image, _)) if start_step > 0 => Some(Self::encode_init_latents(
+                        vae, image, req.width, req.height,
+                    )?),
+                    _ => None,
+                };
+                // F-037: force the control-context (and any img2img init) VAE encode so the check
+                // observes it, then honor a cancel arriving during that encode before the denoise loop.
+                match &clean_init {
+                    Some(ci) => eval([&control_context, ci])?,
+                    None => eval([&control_context])?,
+                }
+                if req.cancel.is_cancelled() {
+                    return Err(Error::Canceled);
+                }
+
+                // Compiled elementwise glue (sc-2963), shared with the base flux2 path. Scoped +
+                // restored on drop by the RAII guard (F-007).
+                let _compile_glue = crate::transformer::CompileGlueGuard::enable();
+
+                let sampler_name = req.sampler.as_deref();
+                let mut images = Vec::with_capacity(req.count as usize);
+                for i in 0..req.count {
+                    let seed = base_seed.wrapping_add(i as u64);
+                    let noise = create_noise(seed, req.width, req.height, self.config.in_channels)?;
+                    let latents = match &clean_init {
+                        Some(clean) => {
+                            add_noise_by_interpolation(clean, &noise, sched.sigmas[start_step])?
+                        }
+                        None => noise,
+                    };
+                    // Curated unified-framework solver (epic 7114 P3); the control branch is the
+                    // `predict` closure. FLUX.2 feeds `sigma · 1000` as the transformer timestep (Sigma
+                    // convention). Cancellation, the per-step `eval`, and progress live in
+                    // `run_flow_sampler`.
+                    let predict = |latents: &Array, sigma: f32| -> Result<Array> {
+                        heavy.transformer.forward(
+                            latents,
+                            &prompt_embeds,
+                            &latent_ids,
+                            &text_ids,
+                            sigma * 1000.0,
+                            embedded_guidance,
+                            &control_context,
+                            control_scale,
+                        )
+                    };
+                    let denoise_sigmas = &sched.sigmas[start_step..];
+                    let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
+                    let final_latents = run_flow_sampler_with_latent_hook(
+                        sampler_name,
+                        TimestepConvention::Sigma,
+                        denoise_sigmas,
+                        latents,
+                        seed,
+                        &req.cancel,
+                        on_progress,
+                        |latents, sigma| {
+                            crate::preview::emit_flux_preview(
+                                &req.preview,
+                                &previews,
+                                denoise_sigmas,
+                                sigma,
+                                latents,
+                                lat_h as i32,
+                                lat_w as i32,
+                                vae,
+                            );
+                        },
+                        predict,
+                    )?;
+                    on_progress(Progress::Decoding);
+                    // The PiD decode overlay (sc-7847) is wired on the FLUX.2 txt2img/edit path;
+                    // `flux2_dev_control` is NOT in that story's model list, so it stays on the native
+                    // VAE — mirroring the sc-7846 Z-Image Fun-ControlNet scoping decision.
+                    let packed =
+                        final_latents.reshape(&[1, lat_h as i32, lat_w as i32, in_channels])?;
+                    let decoded = heavy.vae.decode_packed_latents(&packed)?; // NHWC [1,H,W,3]
+                    let nchw = decoded.transpose_axes(&[0, 3, 1, 2])?;
+                    images.push(decoded_to_image(&nchw)?);
+                }
+                Ok(GenerationOutput::Images(images))
+            },
+        )
+    }
+
+    fn config_default_steps(&self) -> u32 {
+        crate::config::DEFAULT_STEPS_DEV
+    }
+}
+
+/// The Fun-Controlnet-Union is a *union* ControlNet (pose / canny / depth / … share one VAE-encoded
+/// control path), so the input-agnostic default [`mlx_gen::AcceptedControlKinds::Any`] applies and all the
+/// control boilerplate (resolve/validate-present + the load helpers above) comes from the shared
+/// trait (sc-8241). The default message bodies already match this variant's wording, so no override
+/// is needed.
+impl ControlBranch for Flux2DevControl {
+    fn model_id(&self) -> &'static str {
+        FLUX2_DEV_CONTROL_ID
+    }
+}
+
+impl Generator for Flux2DevControl {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        // Shared capability floor (size/count/guidance/negative/accepted conditioning + multiple-of-16),
+        // then the shared control-present check (sc-8241's `ControlBranch::require_control_present`).
+        // `is_edit = false`: the control variant requires a *Control* image, not an edit reference.
+        validate_request(&self.descriptor, false, false, req)?;
+        self.require_control_present(req)?;
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+// The registration constant bridges the crate's rich `Result` into backend-neutral
+// `gen_core::Result`. The `impl Generator`
+// above stays hand-written because `validate` adds a control-conditioning check beyond the shared
+// `validate_request`, so it is not the plain delegation `impl_generator!` expresses.
+mlx_gen::register_generators! {
+    pub(crate) const DEV_CONTROL_REGISTRATION = descriptor_dev_control => load_dev_control;
+    footprint = crate::model::component_footprint
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_gen::WeightsSource;
+
+    #[test]
+    fn descriptor_is_flux2_dev_control() {
+        let d = descriptor_dev_control();
+        assert_eq!(d.id, "flux2_dev_control");
+        assert_eq!(d.family, "flux2");
+        assert!(d.capabilities.accepts(ConditioningKind::Control));
+        assert!(d.capabilities.accepts(ConditioningKind::Reference));
+        // dev embedded guidance: guidance on, negative / true-CFG off; no KV cache; mac-only.
+        assert!(d.capabilities.supports_guidance);
+        assert!(!d.capabilities.supports_negative_prompt);
+        assert!(!d.capabilities.supports_true_cfg);
+        assert!(!d.capabilities.supports_kv_cache);
+        assert!(d.capabilities.mac_only);
+    }
+
+    #[test]
+    fn load_rejects_missing_control_weights() {
+        // Without `spec.control`, load must fail on the missing control weights (proving the control
+        // overlay is wired as a hard requirement) — not on the missing snapshot.
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let err = load_dev_control(&spec)
+            .err()
+            .expect("expected error")
+            .to_string();
+        assert!(err.contains("Fun-Controlnet-Union"), "got: {err}");
+    }
+
+    #[test]
+    fn load_rejects_single_file_base() {
+        let spec = LoadSpec::new(WeightsSource::File("/tmp/dev.safetensors".into()))
+            .with_control(WeightsSource::File("/tmp/control.safetensors".into()));
+        let err = load_dev_control(&spec)
+            .err()
+            .expect("expected error")
+            .to_string();
+        assert!(err.contains("snapshot directory"), "got: {err}");
+    }
+
+    // ── sc-10840: weight-free, default-run proof that the FLUX.2 control dispatch HONORS
+    // `offload_policy`. `build_control_residency` at a non-existent snapshot dir + a control checkpoint:
+    // `Sequential` defers (captures both loaders → `is_sequential`); `Resident` eager-loads the Mistral-3
+    // encoder from the missing dir → `Err`. The real-weight A/B is deferred (weights not on disk).
+    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/flux2-control-residency-test-snapshot".into(),
+        ))
+        .with_control(WeightsSource::File(
+            "/nonexistent/control.safetensors".into(),
+        ))
+        .with_offload_policy(policy)
+    }
+
+    #[test]
+    fn build_residency_sequential_defers_all_component_loads() {
+        let res = build_control_residency(&missing_snapshot_spec(OffloadPolicy::Sequential))
+            .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential (deferred) residency"
+        );
+    }
+
+    #[test]
+    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
+        let err = build_control_residency(&missing_snapshot_spec(OffloadPolicy::Resident))
+            .err()
+            .expect("Resident must eager-load and fail on a missing snapshot dir");
+        assert!(
+            !err.to_string().contains("single .safetensors file"),
+            "expected an eager-load failure: {err}"
+        );
+    }
+}

@@ -1,0 +1,222 @@
+//! # mlx-gen-flux2
+//!
+//! The **FLUX.2-klein** provider crate for [`mlx-gen`](mlx_gen). FLUX.2 shares no crate-local
+//! code with the FLUX.1 family (`mlx-gen-flux`): its text encoder is a **Qwen3** dense LLM
+//! (not T5+CLIP), its VAE is the 32-channel `AutoencoderKL-Flux2` with 2×2 patchify +
+//! BatchNorm-stats normalization (not the 16-ch BFL VAE), and its MMDiT uses fused parallel
+//! single blocks with a 4-axis RoPE. Everything shared lives in the core `mlx-gen` crate
+//! (nn primitives, the `FlowMatchEuler` scheduler, adapters, quant, the `Generator` contract,
+//! the registry), so this is a clean sibling crate, decoupled from FLUX.1.
+//!
+//! Ported from the frozen Python mflux fork (`~/repos/mflux/src/mflux/models/flux2/`) and
+//! parity-gated against it. Target: **FLUX.2-klein-9b** (txt2img + edit); the config is
+//! dimension-parametric so the 4b variant is a near-free follow-on.
+//!
+//! Slice status: **S0** — scaffold, registry ids, dimension-parametric config, the flow-match
+//! schedule (reused from core), 2×2 latent pack/unpack/patchify, the 4-axis RoPE table, and the
+//! latent/text id builders. `load()`/`generate()` are guarded with a clear error until the
+//! text-encoder (S1), VAE (S2), and transformer (S3) modules land.
+
+pub mod adapters;
+mod artifact_inventory;
+mod block_stream;
+pub mod caption_upsample;
+pub mod chunk;
+pub mod config;
+pub mod convert;
+pub mod kv_cache;
+pub mod loader;
+pub mod memory_strategy;
+pub mod model;
+pub mod model_control;
+pub mod pipeline;
+pub mod pos_embed;
+pub mod preview;
+pub mod text_encoder;
+pub mod transformer;
+pub mod vae;
+pub mod vision;
+
+pub use adapters::apply_flux2_adapters;
+pub use caption_upsample::{
+    build_upsample_input_ids, expand_pixtral_image_tokens, upsample_prompt,
+    SYSTEM_MESSAGE_UPSAMPLING_I2I, SYSTEM_MESSAGE_UPSAMPLING_T2I,
+};
+pub use chunk::{map_seq_chunks, MemoryConfig};
+pub use config::{
+    Flux2Config, Flux2Quant, Flux2Variant, DEFAULT_GUIDANCE, DEFAULT_GUIDANCE_DEV, DEFAULT_HEIGHT,
+    DEFAULT_STEPS, DEFAULT_STEPS_DEV, DEFAULT_WIDTH, FLUX2_DEV_CONTROL_ID, FLUX2_DEV_EDIT_ID,
+    FLUX2_DEV_ID, FLUX2_KLEIN_9B_EDIT_ID, FLUX2_KLEIN_9B_ID, FLUX2_KLEIN_9B_KV_EDIT_ID,
+    SIZE_MULTIPLE,
+};
+pub use convert::{
+    build_target_state_dict, convert_and_assemble, quantize_flux2_dit, quantize_flux2_text_encoder,
+    quantize_flux2_text_encoder_dir, quantize_flux2_transformer,
+};
+pub use kv_cache::{CacheMode, Flux2KvCache, Stream};
+pub use loader::{
+    load_control_transformer_dev, load_multimodal_projector_dev, load_text_encoder,
+    load_text_encoder_dev, load_tokenizer, load_tokenizer_dev, load_transformer,
+    load_transformer_dev, load_vae, load_vision_tower_dev,
+};
+pub use model::{
+    descriptor_dev, descriptor_dev_edit, descriptor_klein_9b, descriptor_klein_9b_edit,
+    descriptor_klein_9b_kv_edit, load_dev, load_dev_edit, load_klein_9b, load_klein_9b_edit,
+    load_klein_9b_kv_edit,
+};
+pub use model_control::{descriptor_dev_control, load_dev_control, Flux2DevControl};
+pub use pipeline::{
+    add_noise_by_interpolation, create_noise, init_time_step, pack_latents, patchify_latents,
+    prepare_grid_ids, prepare_text_ids, preprocess_ref_image, schedule, timesteps_x1000,
+    unpack_latents,
+};
+pub use pos_embed::Flux2PosEmbed;
+pub use text_encoder::{Qwen3TextEncoder, Qwen3TextEncoderConfig};
+pub use transformer::{
+    Flux2ControlBranch, Flux2ControlTransformer, Flux2ForwardInputs, Flux2Transformer,
+    Flux2TransformerConfig, CONTROL_IN_DIM,
+};
+pub use vae::Flux2Vae;
+pub use vision::{Mistral3Projector, PixtralVisionConfig, PixtralVisionTower};
+
+/// sc-16209 Apple-Silicon warm sweep: FLUX.2 Klein 9B bf16 peaked below 14.07 GiB at 1024².
+pub const KLEIN_ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryRegistration =
+    mlx_gen::gen_core::ActivationMemoryRegistration {
+        provider_id: FLUX2_KLEIN_9B_ID,
+        anchor: mlx_gen::ActivationMemoryAnchor {
+            bytes_1024: 15_107_547_464,
+        },
+    };
+
+/// Add all MLX FLUX.2 providers to an explicit media registry builder.
+pub fn register_providers(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(model::KLEIN_REGISTRATION)
+        .register_activation_memory(KLEIN_ACTIVATION_MEMORY_REGISTRATION)
+        .register_memory_strategy(model::KLEIN_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: FLUX2_KLEIN_9B_ID,
+            contract: |spec| memory_strategy::weights_free_klein_contract(FLUX2_KLEIN_9B_ID, spec),
+        })
+        .register_memory_behavior(model::KLEIN_MEMORY_BEHAVIOR)
+        .register_generator(model::KLEIN_EDIT_REGISTRATION)
+        .register_memory_strategy(model::KLEIN_EDIT_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: FLUX2_KLEIN_9B_EDIT_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_klein_contract(FLUX2_KLEIN_9B_EDIT_ID, spec)
+            },
+        })
+        .register_memory_behavior(model::KLEIN_EDIT_MEMORY_BEHAVIOR)
+        .register_generator(model::KLEIN_KV_EDIT_REGISTRATION)
+        .register_generator(model::DEV_REGISTRATION)
+        .register_memory_strategy(model::DEV_MEMORY_REGISTRATION)
+        .register_generator(model::DEV_EDIT_REGISTRATION)
+        .register_memory_strategy(model::DEV_EDIT_MEMORY_REGISTRATION)
+        .register_generator(model_control::DEV_CONTROL_REGISTRATION)
+}
+
+/// Build the complete explicit MLX FLUX.2 provider catalog.
+pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::ProviderRegistry> {
+    register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_has_stable_surface() {
+        let registry = super::provider_registry().unwrap();
+        let explicit: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+
+        assert_eq!(
+            explicit,
+            [
+                "flux2_klein_9b",
+                "flux2_klein_9b_edit",
+                "flux2_klein_9b_kv_edit",
+                "flux2_dev",
+                "flux2_dev_edit",
+                "flux2_dev_control",
+            ]
+        );
+
+        let preview_ids: Vec<_> = registry
+            .generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                descriptor
+                    .capabilities
+                    .supports_preview
+                    .then_some(descriptor.id)
+            })
+            .collect();
+        assert_eq!(
+            preview_ids, explicit,
+            "every and only FLUX.2 route previews"
+        );
+    }
+
+    #[test]
+    fn dev_edit_exposes_the_provider_memory_safety_contract() {
+        let registry = super::provider_registry().unwrap();
+        let contract = registry
+            .memory_strategy_contract(
+                super::FLUX2_DEV_EDIT_ID,
+                &mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(Default::default())),
+            )
+            .unwrap()
+            .expect("FLUX.2-dev edit memory contract");
+        assert_eq!(contract.provider_id, super::FLUX2_DEV_EDIT_ID);
+        assert!(contract.conformance_errors().is_empty());
+    }
+
+    #[test]
+    fn dev_t2i_exposes_its_own_provider_memory_safety_contract() {
+        let registry = super::provider_registry().unwrap();
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(Default::default()))
+            .with_quant(mlx_gen::Quant::Q4);
+        let t2i = registry
+            .memory_strategy_contract(super::FLUX2_DEV_ID, &spec)
+            .unwrap()
+            .expect("FLUX.2-dev T2I memory contract");
+        let edit = registry
+            .memory_strategy_contract(super::FLUX2_DEV_EDIT_ID, &spec)
+            .unwrap()
+            .expect("FLUX.2-dev edit memory contract");
+
+        assert_eq!(t2i.provider_id, super::FLUX2_DEV_ID);
+        assert_eq!(edit.provider_id, super::FLUX2_DEV_EDIT_ID);
+        assert_ne!(t2i.calibration, edit.calibration);
+        assert!(t2i.conformance_errors().is_empty());
+        assert_eq!(
+            registry
+                .memory_strategy_registrations()
+                .filter(|registration| registration.provider_id == super::FLUX2_DEV_ID)
+                .count(),
+            1,
+            "the T2I provider must have exactly one memory registration"
+        );
+    }
+
+    #[test]
+    fn klein_shared_ladder_passes_the_weights_free_behavior_oracle() {
+        let registry = super::provider_registry().unwrap();
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
+            .with_pid(
+                mlx_gen::WeightsSource::File("/nonexistent/pid.safetensors".into()),
+                mlx_gen::WeightsSource::Dir("/nonexistent/gemma".into()),
+            );
+        gen_core_testkit::memory_strategy::memory_strategy_registry_conformance(&registry, &spec);
+        assert!(registry
+            .memory_strategy_contract(super::FLUX2_KLEIN_9B_KV_EDIT_ID, &spec)
+            .unwrap()
+            .is_none());
+    }
+}

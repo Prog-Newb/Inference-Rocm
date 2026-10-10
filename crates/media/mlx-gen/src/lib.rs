@@ -1,0 +1,134 @@
+//! # mlx-gen
+//!
+//! Rust-native inference for generative **image and video** models on Apple
+//! [MLX](https://github.com/ml-explore/mlx), built on top of `mlx-rs`.
+//!
+//! **Status: active** — multiple merged, parity-validated provider crates spanning image,
+//! video, identity, and understanding models, consumed in-process as a Rust library.
+//!
+//! Families: FLUX.1 / FLUX.2, Chroma, Qwen-Image (+ Edit), SDXL, Kolors, Z-Image,
+//! SenseNova-U1 (image); Wan2.2, LTX-2.3, SVD (video); PuLID-FLUX, InstantID (identity);
+//! JoyCaption, SAM2 (understanding). Adapters: LoRA, LoKr (with stacking), ControlNet,
+//! IP-Adapter. Plus native MLX LoRA/LoKr training and group-wise Q4/Q8 quantization.
+//!
+//! Architecture: a *disciplined hybrid* of the frozen Python mflux fork — see
+//! [`ARCHITECTURE.md`](https://github.com/michaeltrefry/mlx-gen/blob/main/ARCHITECTURE.md).
+
+// The backend-neutral contract layer (epic 3720). gen-core owns the contracts, registry, request/
+// output types, and pure policy math; mlx-gen re-exports them at the historical `mlx_gen::…` paths
+// below so every downstream `use mlx_gen::…` keeps compiling. Re-exported as a module too, so
+// `mlx_gen::gen_core::{Error, Result}` (the neutral contract error) is reachable by name.
+pub use ::gen_core;
+pub use gen_core::{
+    impl_generator, register_captioner, register_generators, register_image_embedder,
+    register_text_embedder, register_trainer,
+};
+
+// Local MLX modules (tensor ops, weights, quant, samplers' tensor application, error w/ mlx variants).
+pub mod adapters;
+pub mod array;
+pub mod asset_facts;
+// Query-row bounded attention (SC-15615): the MLX half of ladder rung 3, shared so no family forks it.
+pub mod attention;
+// Bounded transformer residency (SC-15750): ladder rung 4, likewise shared — see the module docs for
+// the lazy-graph trap that makes a hand-rolled version silently save nothing.
+pub mod block_residency;
+pub mod error;
+pub mod img2img;
+pub mod memory;
+pub mod mllm;
+pub mod nn;
+pub mod preview;
+pub mod quant;
+pub mod request_scope;
+pub mod residency;
+pub mod sampler;
+pub mod scheduler;
+pub mod text_sample;
+pub mod weights;
+
+// Split modules: contract types in gen-core, MLX impls + lifts local (caption→joycaption,
+// train→kernels, tokenizer→to_arrays, image→decoded_to_image).
+pub mod caption;
+pub mod decoder;
+pub mod image;
+pub mod tokenizer;
+pub mod train;
+
+// Moved-verbatim contract modules — re-exported from gen-core at their old paths.
+pub mod control {
+    pub use gen_core::control::*;
+}
+pub mod generator {
+    pub use gen_core::generator::*;
+}
+pub mod media {
+    pub use gen_core::media::*;
+}
+pub mod registry {
+    pub use gen_core::registry::*;
+}
+pub mod runtime {
+    pub use gen_core::runtime::*;
+}
+pub mod tiling {
+    pub use gen_core::tiling::*;
+}
+pub mod transform {
+    pub use gen_core::transform::*;
+}
+// Array-level tiled-decode blend loop (sc-11747): the MLX half of the gen-core tiling seam, shared by
+// every VAE that tiles a decode (Wan z16/z48, Qwen-Image). gen-core carries the pure geometry
+// ([`tiling::TilePlan`]); this carries the tensor loop.
+pub mod memory_probe;
+pub mod vae_tiling;
+
+pub use attention::{
+    sdpa_budgeted_bhsd, AttentionBudget, AttentionPlan, CONSTRAINED_ATTN_SCORES_BUDGET,
+};
+pub use caption::{
+    CaptionCapabilities, CaptionFinishReason, CaptionOptions, CaptionOutput, CaptionRequest,
+    CaptionSampling, Captioner, CaptionerDescriptor,
+};
+pub use control::{require_base_dir, require_control, AcceptedControlKinds, ControlBranch};
+pub use decoder::LatentDecoder;
+pub use error::{Error, Result};
+pub use gen_core::sampling::{
+    flow_capture_plan, schedule_sigmas, vp_capture_plan, vp_sigma_from_edm, CapturePlan,
+    DiscreteModelSampling, EdmModelSampling, ModelSampling, PredictionType, Scheduler, Solver,
+    TimestepConvention, VpCapturePlan,
+};
+pub use gen_core::weightsmeta::{safetensors_dir_bytes, safetensors_path_bytes};
+pub use generator::{
+    default_seed, ActivationMemoryAnchor, Capabilities, Conditioning, ConditioningKind,
+    ControlClipRef, ControlKind, GenerationOutput, GenerationPhase, GenerationRequest, Generator,
+    KeyframeRef, Modality, ModelDescriptor, PhaseAdapter, ReplacementMode, SizeFloor,
+    StagedResidencyAvailability, VideoClipRef,
+};
+pub use media::{AudioTrack, Image};
+pub use registry::{
+    CaptionerRegistration, ModelRegistration, PerComponentBytes, ProviderRegistry,
+    ProviderRegistryBuilder, TrainerRegistration, TransformRegistration,
+};
+pub use residency::{Residency, StagedHeavy};
+pub use runtime::{
+    AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase,
+    LoadShape, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, Precision, PreviewFrame,
+    PreviewSink, Progress, Quant, WeightsSource,
+};
+pub use sampler::{
+    curated_sampler_names, curated_scheduler_names, resolve_flow_schedule, resolve_schedule,
+    run_av_curated_sampler, run_cfgpp_sampler, run_cfgpp_sampler_with_latent_hook,
+    run_curated_sampler, run_curated_sampler_with_latent_hook, run_flow_sampler,
+    run_flow_sampler_with_latent_hook, AlphaSchedule, AvLatents, DiffusionSampler,
+    FlowMatchSampler, LcmSampler, LightningSampler, MlxAvLatentOps, MlxLatentOps, TcdSampler,
+};
+pub use scheduler::FlowMatchEuler;
+pub use tiling::{TilingConfig, VaeTiling, VideoDecodeMemoryProfile};
+pub use train::{
+    LrSchedule, NetworkType, TrainOptimizer, Trainer, TrainerDescriptor, TrainingConfig,
+    TrainingItem, TrainingOutput, TrainingProgress, TrainingRequest,
+};
+pub use transform::{
+    TargetSize, Transform, TransformCapabilities, TransformDescriptor, TransformRequest,
+};

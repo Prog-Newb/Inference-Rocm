@@ -1,0 +1,649 @@
+//! # candle-gen-sd3
+//!
+//! The **Stable Diffusion 3.5** provider crate for [`candle-gen`](candle_gen) — the candle
+//! (Windows/CUDA) sibling of `mlx-gen-sd3` (epic 7841). It ports the SD3.5 architecture to candle:
+//! the **MMDiT** (joint / double-stream) transformer ([`transformer`]), the **triple text-encoder
+//! aggregator** ([`conditioning`]) that combines CLIP-L + OpenCLIP bigG + T5-XXL into the pooled
+//! (2048) + context (333×4096) conditioning, and the 16-channel **VAE** wiring ([`vae`]).
+//!
+//! **C1 scope (sc-7876):** this story is the *architecture foundation* — the FULL SD3.5 Large
+//! forward at real shapes, the aggregator, the VAE config, and crate registration, with
+//! shape/structural parity tests. The actual T2I **pipeline** (text encoder forward + flow-match
+//! sampler + VAE decode) and the CUDA real-weight smoke land in **C2** (sc-7877); the registered
+//! descriptor here therefore advertises the txt2img surface but [`generate`](Generator::generate)
+//! returns a typed `Unsupported` until C2 wires the pipeline. This keeps the worker honest (it falls
+//! back rather than calling an un-wired path) while the registration + architecture are in place.
+//!
+//! **Parity approach (re-validated):** the macOS `mlx-gen-sd3` reference is NOT present on this
+//! Windows machine, so correctness is established the way epic 7841 did — line-by-line against the
+//! PUBLIC diffusers `SD3Transformer2DModel` / `StableDiffusion3Pipeline` and the SD3 paper, plus
+//! structural/shape unit tests (the `#[cfg(test)]` modules in each sub-module). Any cross-engine
+//! numeric A/B harness is left `#[ignore]`d (reference unavailable here); coherent real-weight
+//! rendering is validated in C2/C6.
+//!
+//! **Key SD3.5 vs FLUX parity note:** SD3.5's MMDiT uses a **learned 2D positional embedding** added
+//! at patchify and runs attention with **NO RoPE** — do not copy FLUX's rotary embedding. The AdaLN
+//! modulation apply order (`x·(1+scale)+shift`, with the correct chunk split) is the documented bug
+//! magnet; see [`transformer`].
+
+pub mod adapters;
+pub mod clip_tokenizer;
+pub mod conditioning;
+pub mod config;
+pub mod memory;
+pub mod pipeline;
+pub mod preview;
+pub mod quant;
+pub mod training;
+pub mod transformer;
+pub mod vae;
+
+// SD3.5 img2img/`Reference` real-weight GPU validation (sc-11784) — env-driven, `#[ignore]`d
+// integration tests driving the REGISTERED Large/Medium (true-CFG) + Turbo (distilled) generators
+// through a `Conditioning::Reference` (strength ablation + the strength-1.0 source round-trip + prompt
+// divergence). The candle/CUDA parity of the mlx-gen-sd3 `denoise_img2img_cfg` lane (sc-10189).
+#[cfg(test)]
+mod img2img_validate;
+
+pub use adapters::{install_additive, merge_adapters, AdditiveReport, MergeReport};
+pub use config::Sd3Config;
+pub use memory::{min_memory_gb, MemoryProfile, ParamCounts, Precision};
+pub use pipeline::Variant;
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use candle_gen::candle_core::{DType, Device};
+use candle_gen::gen_core::{
+    self, AdapterSpec, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
+    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, SizeFloor, WeightsSource,
+};
+
+use pipeline::{Components, Pipeline};
+use vae::VaeEncoder;
+
+/// Registry id for SD3.5 **Large** — matches the SceneWorks worker's `payload.model` and the macOS
+/// `mlx-gen-sd3` SD3.5-Large descriptor.
+pub const MODEL_ID: &str = "sd3_5_large";
+
+/// Registry id for SD3.5 **Large Turbo** — the guidance-distilled 4-step sibling.
+pub const MODEL_ID_TURBO: &str = "sd3_5_large_turbo";
+
+/// Registry id for SD3.5 **Medium** — the MMDiT-X (dual-attention) model. Matches the SceneWorks
+/// worker's `payload.model` and the macOS `mlx-gen-sd3` SD3.5-Medium descriptor.
+pub const MODEL_ID_MEDIUM: &str = "sd3_5_medium";
+
+/// SD3.5 works in latent space at /8 and the MMDiT patchifies that at /2, so both image dims must be
+/// multiples of **16** for a clean patchify. Exposed as the pinned-engine stride SceneWorks ties each
+/// advertised SD3.5 image bucket to (sc-12612), mirroring `wan::config::SIZE_MULTIPLE_14B`. `validate`
+/// enforces exactly this value, so the const cannot drift from the check.
+pub const SIZE_MULTIPLE: u32 = 16;
+
+/// A loaded candle SD3.5 generator. Loading is **lazy**: `load` does no file I/O, and the heavy
+/// components (triple text encoders + MMDiT + VAE) are built on the first
+/// [`generate`](Generator::generate) call and then **cached** so back-to-back requests skip the disk
+/// re-read. The [`Variant`] (Large vs Large Turbo) is fixed at load from the registered id.
+pub struct Sd3Generator {
+    descriptor: ModelDescriptor,
+    root: PathBuf,
+    device: Device,
+    dtype: DType,
+    variant: Variant,
+    /// Optional DiT quantization (`Q4`/`Q8`) applied at first component load (sc-7879). `None` ⇒
+    /// dense bf16. The text encoders + VAE stay dense regardless.
+    quant: Option<Quant>,
+    /// LoRA/LoKr adapters merged into the MMDiT weights at component-load (sc-7881). Empty ⇒ the stock
+    /// mmap build (zero regression). Fixed at load from `spec.adapters`.
+    adapters: Vec<AdapterSpec>,
+    /// Cached components. `Mutex` because `Generator` is shared and `generate` takes `&self`; the lock
+    /// is held only to read/populate the cache, never across the denoise.
+    components: Mutex<Option<Components>>,
+    /// Lazily-built, cached f32 VAE **encoder** for the img2img / `Reference` path (sc-11784). Built on
+    /// the first request that carries a reference AND yields a structure-preserving denoise
+    /// (`start_step > 0`), so a txt2img-only workload never builds it. Cached here (not in `Components`)
+    /// because it loads in f32 for the deterministic mean-encode while `Components` is bf16.
+    vae_encoder: Mutex<Option<Arc<VaeEncoder>>>,
+}
+
+impl Sd3Generator {
+    /// The registry id for this generator's variant (used in validation error prefixes).
+    fn model_id(&self) -> &'static str {
+        match self.variant {
+            Variant::Large => MODEL_ID,
+            Variant::LargeTurbo => MODEL_ID_TURBO,
+            Variant::Medium => MODEL_ID_MEDIUM,
+        }
+    }
+
+    /// Get the cached components, loading (and caching) them on a miss.
+    fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
+        // `?` bridges the candle-side `load_components` error into `gen_core::Error`.
+        Ok(candle_gen::cached(&self.components, || {
+            pipe.load_components()
+        })?)
+    }
+
+    /// Get the cached f32 VAE encoder for the img2img / `Reference` path (sc-11784), building it on a
+    /// miss. Only reached when a request carries a reference that yields a structure-preserving denoise
+    /// (`start_step > 0`), so a txt2img-only workload never builds it.
+    fn vae_encoder(&self, pipe: &Pipeline) -> gen_core::Result<Arc<VaeEncoder>> {
+        // The inner `?` bridges the candle-side `load_vae_encoder` error into `gen_core::Error`.
+        candle_gen::cached(&self.vae_encoder, || Ok(Arc::new(pipe.load_vae_encoder()?)))
+    }
+}
+
+impl Generator for Sd3Generator {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        let id = self.model_id();
+        // The shared capability floor (count/size/negative/guidance/conditioning/sampler).
+        self.descriptor.capabilities.validate_request(id, req)?;
+        if req.prompt.is_empty() {
+            return Err(gen_core::Error::Msg(format!(
+                "{id}: prompt must not be empty"
+            )));
+        }
+        if req.steps == Some(0) {
+            return Err(gen_core::Error::Msg(format!("{id}: steps must be >= 1")));
+        }
+        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+            return Err(gen_core::Error::Msg(format!(
+                "{id}: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+                req.width, req.height
+            )));
+        }
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.validate(req)?;
+        // The light `Pipeline` handle carries the snapshot/device/variant; the heavy components come
+        // from the cache. The rich-`CandleError` tail (including the typed `Canceled`) bridges into
+        // `gen_core::Error` via `?`.
+        let pipe = Pipeline::load(
+            &self.root,
+            &self.device,
+            self.dtype,
+            self.variant,
+            self.quant,
+            &self.adapters,
+        );
+        let components = self.components(&pipe)?;
+
+        // img2img / `Reference` (sc-11784): resolve the single reference + its effective strength, and —
+        // when the strength yields a non-empty structure-preserving denoise (`start_step > 0`) — VAE-encode
+        // it to the clean init latent. `resolve_reference` errors on >1 reference; the capability floor in
+        // `validate` already rejects any non-`Reference` conditioning. The fork `start_step` is computed
+        // against the SAME step count `render` uses (`req.steps` or the variant default), so the strength
+        // knob maps to the intended σ node. Mirrors the mlx-gen-sd3 `denoise_img2img_cfg` lane (sc-10189).
+        let reference = pipeline::resolve_reference(req)?;
+        let steps = req
+            .steps
+            .map(|s| s as usize)
+            .unwrap_or_else(|| self.variant.default_steps());
+        let start_step = match &reference {
+            Some((_, strength)) => pipeline::init_time_step(steps, *strength),
+            None => 0,
+        };
+        let clean = if start_step > 0 {
+            let (image, _) = reference.expect("start_step > 0 implies a reference");
+            let encoder = self.vae_encoder(&pipe)?;
+            Some(pipe.encode_reference(&encoder, image, req.width, req.height)?)
+        } else {
+            None
+        };
+
+        let images = pipe.render(req, &components, clean.as_ref(), start_step, on_progress)?;
+        Ok(GenerationOutput::Images(images))
+    }
+}
+
+/// SD3.5 **Large**'s identity + the wired surface: txt2img with CFG + negative prompt (SD3.5 Large is
+/// NOT guidance-distilled — it uses classifier-free guidance, unlike Turbo), img2img reference-guided
+/// latent-init (sc-11784), Q4/Q8 quant (sc-7879), and LoRA/LoKr adapter merge (sc-7881). Control /
+/// IP-adapter overlays stay off until their own story.
+pub fn descriptor() -> ModelDescriptor {
+    descriptor_for(Variant::Large)
+}
+
+/// SD3.5 **Large Turbo**'s identity + wired surface: guidance-distilled txt2img (no CFG, no negative
+/// prompt) — the 4-step sibling. Same architecture/encoders as Large; only the schedule + CFG-off
+/// differ.
+pub fn descriptor_turbo() -> ModelDescriptor {
+    descriptor_for(Variant::LargeTurbo)
+}
+
+/// SD3.5 **Medium**'s identity + wired surface: the MMDiT-X (dual-attention) txt2img model with CFG +
+/// negative prompt (like Large — NOT distilled). Same triple-TE encoders / 16-ch VAE / flow-match
+/// pipeline; only the transformer (24×1536 MMDiT-X with 13 dual blocks) differs.
+pub fn descriptor_medium() -> ModelDescriptor {
+    descriptor_for(Variant::Medium)
+}
+
+/// Build the descriptor for `variant`. Large advertises CFG + negative prompt; Turbo (distilled)
+/// advertises neither — so the shared `validate_request` rejects guidance/negative on Turbo (the
+/// distilled-model honesty the Z-Image provider uses), keeping the worker from promising a path
+/// `generate` ignores.
+pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
+    let (id, cfg) = match variant {
+        Variant::Large => (MODEL_ID, true),
+        Variant::Medium => (MODEL_ID_MEDIUM, true),
+        Variant::LargeTurbo => (MODEL_ID_TURBO, false),
+    };
+    ModelDescriptor {
+        control_kinds: None,
+        required_components: &[],
+        id,
+        family: "stable-diffusion-3",
+        backend: "candle",
+        modality: Modality::Image,
+        capabilities: Capabilities {
+            // Large uses classifier-free guidance with a negative prompt; Turbo is guidance-distilled
+            // (no CFG, no negative branch).
+            supports_negative_prompt: cfg,
+            supports_guidance: cfg,
+            supports_true_cfg: false,
+            // img2img reference-guided latent-init (sc-11784): a single `Conditioning::Reference` seeds
+            // the denoise from the VAE-encoded reference (`render` + `encode_reference`) — real CFG
+            // (Large/Medium) or the distilled loop (Turbo) over the reduced `start_step..` σ tail. NOT
+            // `MultiReference` (single init image); control / IP-adapter overlays stay refused at load.
+            conditioning: vec![ConditioningKind::Reference],
+            // LoRA/LoKr merged into the MMDiT at load (sc-7881) — kohya `lora_sd3` (fused QKV) +
+            // diffusers-named adapters, folded into the dense weights then quantized.
+            supports_lora: true,
+            supports_lokr: true,
+            samplers: candle_gen::curated_sampler_names(),
+            schedulers: candle_gen::curated_scheduler_names(),
+            supported_guidance_methods: vec![],
+            min_size: 256,
+            max_size: 2048,
+            max_count: 8,
+            mac_only: false,
+            // The MMDiT projections fold to Q4_0/Q8_0 at load (sc-7879, dequant-on-forward); the TE +
+            // VAE stay dense. All three variants share the quant path.
+            supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
+            supports_kv_cache: false,
+            // SD3.5 is a flow-match model; the resolution-independent σ-shift is applied by the
+            // pipeline, so it does not require the loader to pre-shift.
+            requires_sigma_shift: false,
+            supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
+            // sc-16958: every SD3.5 route emits per-step latent previews. All three variants share
+            // one `run_flow_sampler` site, so the flag is variant-independent — see [`crate::preview`]
+            // for the lane enumeration and the reused epic-16624 16-channel fit.
+            supports_preview: true,
+            supports_prompt_enhancement: false,
+            supports_streaming: false,
+            supports_multi_speaker: false,
+            supports_conversation_history: false,
+            supports_conversation_session: false,
+            max_speakers: None,
+            // No audio surface (sc-12834): pure image/video model.
+            audio_sample_rates: vec![],
+            max_audio_duration_secs: None,
+            audio_voices: vec![],
+            audio_languages: vec![],
+            audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
+        },
+    }
+}
+
+/// Construct the candle SD3.5 **Large** generator from a [`LoadSpec`]. `spec.weights` must be a
+/// [`WeightsSource::Dir`] pointing at a `stabilityai/stable-diffusion-3.5-large`-layout diffusers
+/// snapshot (`text_encoder/`, `text_encoder_2/`, `text_encoder_3/`, `transformer/`, `vae/`, plus the
+/// tokenizers). `spec.quantize` (Q4/Q8) folds the MMDiT at load (sc-7879); `spec.adapters` (LoRA/LoKr)
+/// merge into the MMDiT at load (sc-7881). Control / IP-adapter overlays are still refused.
+pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_variant(spec, Variant::Large)
+}
+
+/// Construct the candle SD3.5 **Large Turbo** generator (the guidance-distilled 4-step sibling) from a
+/// `stabilityai/stable-diffusion-3.5-large-turbo`-layout snapshot.
+pub fn load_turbo(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_variant(spec, Variant::LargeTurbo)
+}
+
+/// Construct the candle SD3.5 **Medium** generator (the MMDiT-X dual-attention model) from a
+/// `stabilityai/stable-diffusion-3.5-medium`-layout diffusers snapshot.
+pub fn load_medium(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_variant(spec, Variant::Medium)
+}
+
+/// Shared loader for both variants. Lazy — no file I/O until the first `generate`.
+fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn Generator>> {
+    let id = match variant {
+        Variant::Large => MODEL_ID,
+        Variant::LargeTurbo => MODEL_ID_TURBO,
+        Variant::Medium => MODEL_ID_MEDIUM,
+    };
+    let root = match &spec.weights {
+        WeightsSource::Dir(p) => p.clone(),
+        WeightsSource::File(_) => {
+            return Err(gen_core::Error::Msg(format!(
+                "{id} expects a snapshot directory (text_encoder/ text_encoder_2/ text_encoder_3/ \
+                 transformer/ vae/), not a single .safetensors file"
+            )));
+        }
+    };
+    // sc-7879: Q4/Q8 quantize the MMDiT at load (dequant-on-forward). `Quant` only has Q4/Q8, so any
+    // requested level is supported; `None` ⇒ dense bf16.
+    let quant = spec.quantize;
+    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {id} does not support control / IP-adapter overlays (txt2img only)"
+        )));
+    }
+    // sc-7881: LoRA/LoKr adapters are merged into the MMDiT at load (kohya `lora_sd3` fused-QKV +
+    // diffusers-named); they are validated/folded lazily on the first `generate`. No refusal here.
+    // SD3.5 is a bf16 model; the device is the backend selected at compile time.
+    let device = candle_gen::default_device()?;
+    Ok(Box::new(Sd3Generator {
+        descriptor: descriptor_for(variant),
+        root,
+        device,
+        dtype: DType::BF16,
+        variant,
+        quant,
+        adapters: spec.adapters.clone(),
+        components: Mutex::new(None),
+        vae_encoder: Mutex::new(None),
+    }))
+}
+
+// Link-time self-registration into gen-core's model registry — both the Large and Turbo ids.
+candle_gen::register_generators! {
+    pub(crate) const LARGE_REGISTRATION = descriptor => load
+}
+candle_gen::register_generators! {
+    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo
+}
+candle_gen::register_generators! {
+    pub(crate) const MEDIUM_REGISTRATION = descriptor_medium => load_medium
+}
+
+/// Add all Candle SD3 providers to an explicit media registry builder.
+pub fn register_providers(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(LARGE_REGISTRATION)
+        .register_generator(TURBO_REGISTRATION)
+        .register_generator(MEDIUM_REGISTRATION)
+        .register_trainer(training::LARGE_TRAINER_REGISTRATION)
+        .register_trainer(training::MEDIUM_TRAINER_REGISTRATION)
+}
+
+/// Build the complete explicit Candle SD3 provider catalog.
+pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
+    register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_has_stable_surface() {
+        let registry = super::provider_registry().unwrap();
+        let explicit: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+
+        assert_eq!(
+            explicit,
+            ["sd3_5_large", "sd3_5_large_turbo", "sd3_5_medium"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_gen::gen_core::{Conditioning, ConditioningKind, Image, LoadSpec, WeightsSource};
+
+    #[test]
+    fn sd3_registers_and_resolves_as_candle() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .expect("candle sd3 is registered");
+        assert_eq!(g.descriptor().id, MODEL_ID);
+        assert_eq!(g.descriptor().family, "stable-diffusion-3");
+        assert_eq!(g.descriptor().backend, "candle");
+        assert_eq!(g.descriptor().modality, Modality::Image);
+    }
+
+    #[test]
+    fn descriptor_advertises_cfg_txt2img_surface() {
+        let d = descriptor();
+        // SD3.5 Large uses classifier-free guidance with a negative prompt (NOT distilled).
+        assert!(d.capabilities.supports_guidance);
+        assert!(d.capabilities.supports_negative_prompt);
+        assert!(!d.capabilities.mac_only);
+        // sc-11784: img2img reference-guided latent-init is now advertised (single-ref, NOT MultiReference).
+        assert_eq!(
+            d.capabilities.conditioning,
+            vec![ConditioningKind::Reference]
+        );
+        // sc-7881: LoRA/LoKr are now wired (merged into the MMDiT at load).
+        assert!(d.capabilities.supports_lora);
+        assert!(d.capabilities.supports_lokr);
+        // sc-7879: the MMDiT folds to Q4/Q8 at load (TE+VAE stay dense).
+        assert_eq!(
+            d.capabilities.supported_quants,
+            &[
+                candle_gen::gen_core::Quant::Q4,
+                candle_gen::gen_core::Quant::Q8
+            ]
+        );
+        assert_eq!(d.capabilities.min_size, 256);
+        assert_eq!(d.capabilities.max_size, 2048);
+        assert_eq!(d.capabilities.samplers, candle_gen::curated_sampler_names());
+        // sc-11784: the img2img `Reference` conditioning is now accepted.
+        assert!(descriptor()
+            .capabilities
+            .accepts(ConditioningKind::Reference));
+    }
+
+    #[test]
+    fn validate_accepts_txt2img_and_rejects_unsupported() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
+
+        let ok = GenerationRequest {
+            prompt: "a rusty robot holding a lit candle".into(),
+            ..Default::default()
+        };
+        assert!(g.validate(&ok).is_ok());
+
+        // sc-11784: an img2img `Reference` request now validates (the capability floor accepts it).
+        let img2img = GenerationRequest {
+            prompt: "a rusty robot holding a lit candle".into(),
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: Some(0.6),
+            }],
+            ..Default::default()
+        };
+        assert!(g.validate(&img2img).is_ok());
+
+        for bad in [
+            GenerationRequest::default(), // empty prompt
+            GenerationRequest {
+                prompt: "x".into(),
+                width: 1000, // not multiple of 16
+                ..Default::default()
+            },
+            GenerationRequest {
+                prompt: "x".into(),
+                steps: Some(0),
+                ..Default::default()
+            },
+        ] {
+            assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
+        }
+
+        // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised SD3.5 bucket
+        // to. Pin the value and mutation-check that a size which is a multiple of 8 (the VAE scale) but
+        // not SIZE_MULTIPLE (16) is still rejected with the stride error, and an on-stride size passes.
+        assert_eq!(SIZE_MULTIPLE, 16);
+        let off_stride = g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1000, // 125×8 — a multiple of 8 but not SIZE_MULTIPLE
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            off_stride.contains("multiples of 16"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1024, // 64×16 — on-stride
+                ..Default::default()
+            })
+            .is_ok());
+    }
+
+    /// C2 wires `generate`, so it now passes validation and proceeds to component load. Against a
+    /// nonexistent snapshot it fails at load with a *non-`Unsupported`* error (the dir is missing) —
+    /// i.e. the pipeline path is reached, not the old typed-`Unsupported` stub.
+    #[test]
+    fn generate_is_wired_and_loads_components() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
+        let req = GenerationRequest {
+            prompt: "x".into(),
+            ..Default::default()
+        };
+        let mut progress = |_p: Progress| {};
+        let err = g
+            .generate(&req, &mut progress)
+            .expect_err("missing snapshot dir must error at load");
+        // The pipeline IS wired now — the error is the missing component dir, not the C1 stub.
+        assert!(
+            !matches!(err, gen_core::Error::Unsupported(_)),
+            "generate should reach the pipeline (load error), not the un-wired stub: {err:?}"
+        );
+    }
+
+    /// Both the Large and Turbo ids register and resolve as candle generators with distinct surfaces.
+    #[test]
+    fn turbo_registers_and_advertises_distilled_surface() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID_TURBO, &spec)
+            .expect("candle sd3 turbo is registered");
+        assert_eq!(g.descriptor().id, MODEL_ID_TURBO);
+        assert_eq!(g.descriptor().family, "stable-diffusion-3");
+        assert_eq!(g.descriptor().backend, "candle");
+
+        let d = descriptor_turbo();
+        // Turbo is guidance-distilled: no CFG, no negative prompt.
+        assert!(!d.capabilities.supports_guidance, "turbo is distilled");
+        assert!(!d.capabilities.supports_negative_prompt);
+        assert!(!d.capabilities.mac_only);
+
+        // Turbo validate rejects guidance + negative prompt (distilled-model honesty).
+        for bad in [
+            GenerationRequest {
+                prompt: "x".into(),
+                guidance: Some(5.0),
+                ..Default::default()
+            },
+            GenerationRequest {
+                prompt: "x".into(),
+                negative_prompt: Some("blurry".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(g.validate(&bad).is_err(), "turbo should reject: {bad:?}");
+        }
+    }
+
+    /// SD3.5 **Medium** registers + resolves as a candle generator and advertises the CFG txt2img
+    /// surface (like Large, NOT distilled).
+    #[test]
+    fn medium_registers_and_advertises_cfg_surface() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID_MEDIUM, &spec)
+            .expect("candle sd3 medium is registered");
+        assert_eq!(g.descriptor().id, MODEL_ID_MEDIUM);
+        assert_eq!(g.descriptor().family, "stable-diffusion-3");
+        assert_eq!(g.descriptor().backend, "candle");
+        assert_eq!(g.descriptor().modality, Modality::Image);
+
+        let d = descriptor_medium();
+        // Medium uses classifier-free guidance + a negative prompt (it is NOT guidance-distilled).
+        assert!(d.capabilities.supports_guidance);
+        assert!(d.capabilities.supports_negative_prompt);
+        assert!(!d.capabilities.mac_only);
+
+        // A txt2img request validates; sc-11784 also accepts an img2img `Reference` (single init image).
+        let ok = GenerationRequest {
+            prompt: "a rusty robot holding a lit candle".into(),
+            ..Default::default()
+        };
+        assert!(g.validate(&ok).is_ok());
+        assert!(d.capabilities.accepts(ConditioningKind::Reference));
+    }
+
+    #[test]
+    fn load_accepts_quant_and_adapter_surfaces() {
+        use candle_gen::gen_core::{AdapterKind, AdapterSpec, Quant};
+        // sc-7879: Q4/Q8 quant is ACCEPTED (the MMDiT folds at load); loading is lazy so this builds
+        // the generator without touching the (nonexistent) snapshot.
+        let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
+        assert!(
+            load(&quant).is_ok(),
+            "Q8 quant load must be accepted (sc-7879)"
+        );
+        let quant4 = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q4);
+        assert!(
+            load(&quant4).is_ok(),
+            "Q4 quant load must be accepted (sc-7879)"
+        );
+
+        // sc-7881: LoRA/LoKr adapters are now ACCEPTED (merged into the MMDiT at load, lazily). The
+        // spec is stashed; the actual merge happens on the first `generate` against a real snapshot.
+        for kind in [AdapterKind::Lora, AdapterKind::Lokr] {
+            let adapter = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
+                AdapterSpec::new("/lora.safetensors".into(), 1.0, kind),
+            ]);
+            assert!(
+                load(&adapter).is_ok(),
+                "{kind:?} adapter load must be accepted (sc-7881)"
+            );
+        }
+    }
+
+    #[test]
+    fn load_rejects_single_file_source() {
+        let spec = LoadSpec::new(WeightsSource::File("/tmp/sd3.safetensors".into()));
+        let Err(e) = load(&spec) else {
+            panic!("single-file source must be refused")
+        };
+        assert!(e.to_string().contains("snapshot directory"), "got: {e}");
+    }
+}

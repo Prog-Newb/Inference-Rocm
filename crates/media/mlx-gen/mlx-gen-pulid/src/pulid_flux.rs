@@ -1,0 +1,892 @@
+//! PuLID-FLUX end-to-end generate (sc-3074) + native face wiring (sc-3073).
+//!
+//! Assembles the full face-identity path on top of the FLUX.1-dev backbone:
+//!   1. **Face analysis** (native MLX, epic 3079): the reference face (`Conditioning::Reference`) →
+//!      `mlx_gen_face::FaceAnalysis` → largest face's ArcFace embedding (512-d) + `face_features_image`
+//!      (512² aligned, background-whitened grayscale). No Python/onnx.
+//!   2. **EVA-CLIP** (sc-3070): `face_features_image` → resize/normalize → `id_cond_vit` (768-d,
+//!      L2-normalized) + 5 hidden states.
+//!   3. **IDFormer** (sc-3071): `id_cond = cat(arcface 512, id_cond_vit 768)` + hidden → `id_embedding`
+//!      `[1,32,2048]`.
+//!   4. **CA injection** (sc-3072): build `PulidCa` and run the FLUX flow-match denoise through
+//!      `Flux1::generate_with_injector` (fake-CFG, true_cfg=1.0) → AE decode.
+//!
+//! The whole conditioning path runs in **f32**: mlx-gen-flux keeps the DiT image stream in f32 (mixed
+//! precision, sc-2787), so f32 CA weights/id_embedding inject cleanly into the f32 hidden tokens (no
+//! dtype mismatch) and at higher accuracy than the reference's bf16 — the e2e gate is ArcFace-cosine
+//! (cross-encoder, loose), so this is strictly safe. Real-CFG / uncond-id is sc-3075; quant is sc-3076.
+
+use std::path::{Path, PathBuf};
+
+use mlx_rs::ops::{concatenate_axis, divide, maximum, sqrt, square, sum_axes};
+use mlx_rs::{Array, Dtype};
+
+use mlx_gen::media::Image;
+use mlx_gen::weights::Weights;
+use mlx_gen::{
+    curated_sampler_names, curated_scheduler_names, gen_core, CancelFlag, Capabilities,
+    Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator,
+    LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, SizeFloor, WeightsSource,
+};
+use mlx_gen_face::FaceAnalysis;
+use mlx_gen_flux::config::FluxVariant;
+use mlx_gen_flux::model::{load_flux1, Flux1};
+
+use crate::ca::PulidCa;
+use crate::eva_clip::{transform, EvaConfig, EvaVisionTransformer};
+use crate::idformer::{IdFormer, IdFormerConfig};
+
+/// FLUX.1-dev DiT block counts (the PuLID injection schedule is defined over these).
+const NUM_DOUBLE_BLOCKS: usize = 19;
+const NUM_SINGLE_BLOCKS: usize = 38;
+/// Default step from which the real-CFG (and uncond-id) branch engages when the request leaves
+/// `timestep_to_start_cfg` unset — the upstream PuLID default (the photoreal preset overrides to 4
+/// via `req.timestep_to_start_cfg`).
+const DEFAULT_TIMESTEP_TO_START_CFG: usize = 1;
+/// ArcFace (antelopev2) face embedding width — the first half of the IdFormer `id_cond`
+/// (`cat(arcface, id_cond_vit)`). The id_cond_vit half is the EVA head's `proj_dim`.
+const ARCFACE_DIM: i32 = 512;
+pub const MODEL_ID: &str = "pulid_flux";
+
+pub fn descriptor() -> ModelDescriptor {
+    ModelDescriptor {
+        control_kinds: None,
+        required_components: &[],
+        id: MODEL_ID,
+        family: "pulid",
+        backend: "mlx",
+        modality: Modality::Image,
+        capabilities: Capabilities {
+            // PuLID drives its OWN real-CFG (sc-3075): `generate` reads `req.true_cfg` (>1 enables the
+            // pos/neg identity branches) and `req.negative_prompt` (the negative branch text). The
+            // descriptor must advertise what `generate` actually honors, else the shared floor (which
+            // `validate` now delegates to, F-026) would reject the very request that drives the feature.
+            supports_negative_prompt: true, // honored in the real-CFG branch (sc-3075)
+            supports_guidance: true,        // FLUX.1-dev guidance-distilled CFG (default ~4.0)
+            supports_true_cfg: true, // >1 enables real-CFG pos/neg identity branches (sc-3075)
+            conditioning: vec![ConditioningKind::Reference], // the reference face
+            supports_lora: false,
+            supports_lokr: false,
+            // Epic 7114 (sc-7297): PuLID delegates its denoise to the FLUX.1-dev backbone
+            // (`generate_with_injector_cfg` → `run_denoise` → `run_flow_sampler`), which already
+            // honors the full curated integrator menu over the flow-match σ schedule AND the curated
+            // scheduler axis (it threads `req.sampler` / `req.scheduler`). The descriptor previously
+            // advertised only `flow_match`, silently N3-dropping every curated name; mirror the
+            // backbone's menu so the curated samplers are selectable. `hyper` is intentionally NOT
+            // advertised — it needs the dev Hyper-FLUX LoRA loaded at scale, which PuLID does not load.
+            // Pure advertised-name change: the curated names route through the SAME, already-tested
+            // FLUX flow denoise (no new code path, parity by construction). `flow_match` kept as the
+            // legacy default alias (== Euler); `linear` kept as the native default scheduler.
+            samplers: {
+                let mut s = curated_sampler_names();
+                s.push("flow_match");
+                s
+            },
+            schedulers: {
+                let mut s = curated_scheduler_names();
+                s.push("linear");
+                s
+            },
+            supported_guidance_methods: vec![],
+            min_size: 256,
+            max_size: 2048,
+            max_count: 8,
+            mac_only: true,
+            supports_kv_cache: false,
+            requires_sigma_shift: true, // dev
+            supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
+            supports_preview: true,
+            supports_prompt_enhancement: false,
+            supports_streaming: false,
+            supports_multi_speaker: false,
+            supports_conversation_history: false,
+            supports_conversation_session: false,
+            max_speakers: None,
+            // No audio surface (sc-12834): pure image/video model.
+            audio_sample_rates: vec![],
+            max_audio_duration_secs: None,
+            audio_voices: vec![],
+            audio_languages: vec![],
+            audio_edit_modes: vec![],
+            supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
+            size_floor: SizeFloor::RangeChecked,
+        },
+    }
+}
+
+/// L2-normalize each row of `[B, D]` over the feature axis (the PuLID `id_cond_vit` normalization).
+fn l2_normalize_rows(x: &Array) -> Result<Array> {
+    let sumsq = sum_axes(&square(x)?, &[1], true)?; // [B, 1]
+                                                    // Clamp the norm to a tiny epsilon (torch `F.normalize`'s default eps) so a degenerate zero-norm
+                                                    // row — e.g. a bad ArcFace crop — yields a zero vector instead of NaN-poisoning the entire
+                                                    // identity-conditioned generation. Byte-identical for real embeddings (norm >> eps) (F-078).
+    let norm = maximum(&sqrt(&sumsq)?, Array::from_f32(1e-12))?;
+    Ok(divide(x, &norm)?)
+}
+
+pub struct PulidFlux {
+    descriptor: ModelDescriptor,
+    flux: Flux1,
+    eva: EvaVisionTransformer,
+    idformer: IdFormer,
+    /// The PuLID checkpoint weights (f32) — kept to build a per-generate [`PulidCa`] bound to the
+    /// computed id_embedding. `pulid_encoder.*` already consumed by `idformer`; `pulid_ca.*` here.
+    pulid: Weights,
+    face: FaceAnalysis,
+    memory_strategy: gen_core::MemoryProviderContract,
+    loaded_spec: LoadSpec,
+    identity_inventory: Option<crate::memory_strategy::IdentityArtifactInventory>,
+}
+
+impl PulidFlux {
+    /// Build from already-loaded sub-models. `pulid` must hold both `pulid_encoder.*` and
+    /// `pulid_ca.*` (cast to f32); `eva`/`idformer` must likewise be f32 (the conditioning path).
+    /// `face` must have a parser attached (`with_parser`) for `face_features_image`.
+    pub fn new(
+        flux: Flux1,
+        eva: EvaVisionTransformer,
+        pulid: Weights,
+        face: FaceAnalysis,
+    ) -> Result<Self> {
+        let idformer = IdFormer::from_weights(&pulid, "pulid_encoder", IdFormerConfig::default())?;
+        let mut memory_strategy = flux.memory_strategy_contract().cloned().unwrap_or_else(|| {
+            gen_core::MemoryProviderContract::compatibility_default(
+                MODEL_ID,
+                gen_core::MemoryBackendRealization::MlxMetal {
+                    bounded_wired_residency: true,
+                    lazy_or_mmap_materialization: true,
+                    explicit_evaluation_and_synchronization: true,
+                    cache_eviction: true,
+                },
+            )
+        });
+        memory_strategy.provider_id = MODEL_ID.into();
+        memory_strategy.calibration = None;
+        Ok(Self {
+            descriptor: descriptor(),
+            flux,
+            eva,
+            idformer,
+            pulid,
+            face,
+            memory_strategy,
+            loaded_spec: LoadSpec::new(WeightsSource::Dir("/constructed-pulid".into())),
+            identity_inventory: None,
+        })
+    }
+
+    fn new_loaded(
+        flux: Flux1,
+        eva: EvaVisionTransformer,
+        pulid: Weights,
+        face: FaceAnalysis,
+        loaded_spec: LoadSpec,
+        memory_strategy: gen_core::MemoryProviderContract,
+        identity_inventory: crate::memory_strategy::IdentityArtifactInventory,
+    ) -> Result<Self> {
+        let mut model = Self::new(flux, eva, pulid, face)?;
+        model.loaded_spec = loaded_spec;
+        model.memory_strategy = memory_strategy;
+        model.identity_inventory = Some(identity_inventory);
+        Ok(model)
+    }
+
+    /// Face image (RGB, row-major, `h×w`) → `id_embedding` `[1,32,2048]`. Mirrors PuLID's
+    /// `get_id_embedding` (the conditional side; cal_uncond is sc-3075).
+    ///
+    /// `cancel` (F-108): the identity tower is the priciest pre-denoise stage (SCRFD + BiSeNet +
+    /// ArcFace, then the 24-block EVA-CLIP tower + IDFormer), and previously ran with zero cancel
+    /// checks. We check between stages. `analyze` / `face_features_image` already materialize to host
+    /// (`Face.embedding` is a `Vec<f32>`), so the check after them is effective as-is; the EVA tower
+    /// output is lazy, so we `eval` it before the check ahead of the IDFormer (no lazy-eval false
+    /// green). Returns [`Error::Canceled`] on trip.
+    pub fn compute_id_embedding(
+        &self,
+        pixels: &[u8],
+        h: usize,
+        w: usize,
+        cancel: &CancelFlag,
+    ) -> Result<Array> {
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let faces = self.face.analyze(pixels, h, w)?;
+        let face = faces.first().ok_or_else(|| {
+            Error::Msg("pulid_flux: no face detected in the reference image".into())
+        })?;
+        // ArcFace 512-d (id_ante_embedding) — raw, un-normalized, matching the reference.
+        let arcface = Array::from_slice(&face.embedding, &[1, face.embedding.len() as i32]);
+        // face_features_image (512² aligned, bg-whitened gray) → EVA 336² transform → tower.
+        let ffi = self.face.face_features_image(pixels, h, w, face)?;
+        // SCRFD/BiSeNet/ArcFace above are host-materialized; honor a cancel before the EVA tower.
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let eva_in = transform::eva_transform(&ffi, self.eva_image_size())?;
+        let eva_out = self.eva.forward(&eva_in)?;
+        // Force the 24-block EVA tower so the check observes real progress before the IDFormer.
+        mlx_rs::transforms::eval(&eva_out.hidden)?;
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let id_cond_vit = l2_normalize_rows(&eva_out.id_cond_vit)?; // [1,768]
+        let id_cond = concatenate_axis(&[&arcface, &id_cond_vit], 1)?; // [1,1280]
+        self.idformer.forward(&id_cond, &eva_out.hidden)
+    }
+
+    /// The unconditional id_embedding — IDFormer over **zeroed** id_cond + zeroed hidden states (the
+    /// PuLID `get_id_embedding(cal_uncond=True)` path), injected on the negative real-CFG branch.
+    pub fn compute_uncond_id_embedding(&self) -> Result<Array> {
+        // Derive the EVA token geometry from the loaded tower's config, not the default-tower
+        // constants (F-082): seq = grid²+1 (CLS + patches) = 577, embed = embed_dim = 1024, and one
+        // zeroed hidden state per captured block (5). `id_cond` is the IdFormer input width (ArcFace
+        // 512 + the EVA head's proj_dim 768).
+        let cfg = self.eva.config();
+        let seq = cfg.grid() * cfg.grid() + 1;
+        let embed = cfg.embed_dim;
+        let id_cond_dim = ARCFACE_DIM + cfg.proj_dim;
+        let id_cond = Array::from_slice(&vec![0f32; id_cond_dim as usize], &[1, id_cond_dim]);
+        let hidden: Vec<Array> = cfg
+            .hidden_capture
+            .iter()
+            .map(|_| Array::from_slice(&vec![0f32; (seq * embed) as usize], &[1, seq, embed]))
+            .collect();
+        self.idformer.forward(&id_cond, &hidden)
+    }
+
+    fn eva_image_size(&self) -> i32 {
+        self.eva.config().image_size
+    }
+
+    fn reference_face<'a>(&self, req: &'a GenerationRequest) -> Result<(&'a Image, f32)> {
+        select_reference_face(&req.conditioning)
+    }
+}
+
+/// Pick the single reference-face conditioning, rejecting any other kind. PuLID-FLUX advertises only
+/// `ConditioningKind::Reference`, so a stray Control/Mask/etc. attached by a worker must **error**
+/// rather than be silently dropped when `generate` clears `flux_req.conditioning` (F-094).
+fn select_reference_face(conditioning: &[Conditioning]) -> Result<(&Image, f32)> {
+    let mut found = None;
+    for c in conditioning {
+        match c {
+            Conditioning::Reference { image, strength } => {
+                if found.is_some() {
+                    return Err(Error::Msg(
+                        "pulid_flux: exactly one reference face is supported".into(),
+                    ));
+                }
+                // The reference strength is the PuLID id_weight (0–3, default 1.0).
+                found = Some((image, strength.unwrap_or(1.0)));
+            }
+            other => {
+                return Err(Error::Msg(format!(
+                    "pulid_flux: unsupported conditioning {:?} — only a reference face \
+                     (Conditioning::Reference) is accepted",
+                    other.kind()
+                )));
+            }
+        }
+    }
+    found.ok_or_else(|| {
+        Error::Msg(
+            "pulid_flux: a reference face image (Conditioning::Reference) is required".into(),
+        )
+    })
+}
+
+impl Generator for PulidFlux {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        // Validate against PuLID's OWN descriptor, not the FLUX-dev backbone's (F-026). `generate`
+        // delegates the denoise to `PulidFlux::flux` (the dev backbone), whose descriptor advertises
+        // the `hyper` sampler — but PuLID deliberately does NOT load the dev Hyper LoRA, so a `hyper`
+        // request would silently render WITHOUT it. PuLID's descriptor omits `hyper`, so delegating to
+        // its own capability floor rejects that (and every other un-advertised sampler/scheduler,
+        // negative_prompt, true_cfg, size/count/steps) instead of the backbone waving it through. The
+        // `?` keeps the typed `Error::Unsupported` for capability gaps.
+        self.descriptor
+            .capabilities
+            .validate_request(self.descriptor.id, req)?;
+        // PuLID-specific: a reference face image is required (consumed into the identity injector).
+        self.reference_face(req)?;
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.loaded_spec, &self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(&self.loaded_spec, &self.memory_strategy, context)
+    }
+}
+
+impl PulidFlux {
+    /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
+    /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
+    /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
+    fn generate_impl(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        self.verify_identity_inventory()?;
+        // Self-validate first, like every sibling generate_impl (chroma/svd/ideogram) — against
+        // PuLID's OWN descriptor floor (F-026), so a caller that skips `validate` still gets the
+        // typed `Unsupported` (e.g. `sampler: "hyper"`, which PuLID deliberately doesn't advertise
+        // because it never loads the dev Hyper-FLUX LoRA) instead of a silently degraded render
+        // (F-011). The `?` bridges `gen_core::Error` → `Error` with `Unsupported` kept typed.
+        self.validate(req)?;
+        // F-108: the identity stack (face analysis + EVA tower + IDFormer + CA build + the backbone
+        // T5/CLIP encodes) is the priciest pre-denoise work and previously ran with zero cancel
+        // checks. Bail up front, and `compute_id_embedding` checks between its own stages.
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let (image, id_weight) = self.reference_face(req)?;
+        let id_embedding = self.compute_id_embedding(
+            &image.pixels,
+            image.height as usize,
+            image.width as usize,
+            &req.cancel,
+        )?;
+        let mk_ca = |emb: Array| {
+            PulidCa::from_weights(
+                &self.pulid,
+                "pulid_ca",
+                emb,
+                id_weight,
+                NUM_DOUBLE_BLOCKS,
+                NUM_SINGLE_BLOCKS,
+            )
+            .map(|ca| {
+                ca.with_bounded_attention(
+                    req.cancel.clone(),
+                    req.memory.is_some_and(|memory| memory.chunk_attention),
+                )
+            })
+        };
+        // The reference face is consumed into the injector; hand the FLUX backbone a plain request
+        // (it rejects conditioning + negative_prompt it doesn't itself implement — both are handled
+        // here / passed to the CFG denoise directly).
+        let mut flux_req = req.clone();
+        flux_req.conditioning = Vec::new();
+        flux_req.negative_prompt = None;
+        flux_req.true_cfg = None; // PuLID drives real-CFG itself; the backbone forbids it
+
+        // The CA-module builds + (for real-CFG) the uncond IDFormer pass still precede the backbone
+        // encodes; honor a cancel that arrived during the identity tower before starting them.
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let true_cfg = req.true_cfg.unwrap_or(1.0);
+        let result = if true_cfg > 1.0 + 1e-3 {
+            // Real-CFG (sc-3075): positive (id) + negative (uncond id) branches + a negative prompt.
+            let pos = mk_ca(id_embedding)?;
+            let neg = mk_ca(self.compute_uncond_id_embedding()?)?;
+            let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
+            let start_cfg = req
+                .timestep_to_start_cfg
+                .map(|v| v as usize)
+                .unwrap_or(DEFAULT_TIMESTEP_TO_START_CFG);
+            self.flux.generate_with_injector_cfg(
+                &flux_req,
+                &pos,
+                &neg,
+                neg_prompt,
+                true_cfg,
+                start_cfg,
+                on_progress,
+            )
+        } else {
+            // Fake-CFG (true_cfg = 1.0): single forward (sc-3074), bit-identical to that path.
+            self.flux
+                .generate_with_injector(&flux_req, Some(&mk_ca(id_embedding)?), on_progress)
+        };
+        self.verify_identity_inventory()?;
+        result
+    }
+
+    fn verify_identity_inventory(&self) -> Result<()> {
+        self.identity_inventory
+            .as_ref()
+            .map_or(Ok(()), |inventory| {
+                inventory.ensure_unchanged().map_err(Into::into)
+            })
+    }
+}
+
+// ---- registration -------------------------------------------------------------------------------
+
+/// Extract the `PathBuf` from a spec-supplied identity [`WeightsSource`], validating existence with a
+/// clear, slot-named message (F-114 / sc-13664). Accepts either `File` or `Dir` — the caller knows
+/// which it expects. This is the ONLY identity-path resolver: every path is caller-supplied via
+/// `LoadSpec::identity`, with no env / HF-cache fallback.
+fn spec_path(src: &WeightsSource, what: &str) -> Result<PathBuf> {
+    let p = match src {
+        WeightsSource::File(p) | WeightsSource::Dir(p) => p.clone(),
+    };
+    if !p.exists() {
+        return Err(Error::Msg(format!(
+            "pulid_flux: LoadSpec identity {what} path does not exist: {}",
+            p.display()
+        )));
+    }
+    Ok(p)
+}
+
+/// Load EVA weights (f32) from a converted safetensors (tools/convert_eva_clip.py output). Keys are
+/// bare mlx-names (no prefix).
+fn load_eva(path: &Path) -> Result<EvaVisionTransformer> {
+    let mut w = Weights::from_file(path)?;
+    w.cast_all(Dtype::Float32)?;
+    EvaVisionTransformer::from_weights(&w, "", EvaConfig::default())
+}
+
+/// Registered loader for the `pulid_flux` target. Every identity sub-model path is **required** and
+/// comes from `LoadSpec::identity` (sc-13664 — no `PULID_*` env vars, no on-disk HF-cache scan; an
+/// absent slot or sub-field is a load-time, actionable error). Weight sources:
+///   * FLUX.1-dev snapshot dir — `spec.weights` (Dir).
+///   * identity encoder — `spec.identity.encoder` (`pulid_flux_v0.9.1.safetensors`).
+///   * EVA tower — `spec.identity.eva` (converted EVA02-CLIP-L-14-336).
+///   * face dir — `spec.identity.face_dir` (scrfd_10g / arcface_iresnet100 / bisenet_parsing).
+pub fn load_pulid_flux(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    // sc-13664: require the identity slot and each sub-field, and resolve (existence-check) every path
+    // BEFORE the FLUX backbone load — so a missing identity slot/field fails fast at load with a
+    // slot-named error, never a mid-load `PULID_*` env / HF-cache fetch.
+    let identity = spec.identity.as_ref().ok_or_else(|| {
+        Error::Msg(
+            "pulid_flux requires the identity weights — set LoadSpec::identity with encoder / eva / \
+             face_dir (WeightsSource paths); there is no PULID_* env or HF-cache fallback"
+                .into(),
+        )
+    })?;
+    let encoder = identity.encoder.as_ref().ok_or_else(|| {
+        Error::Msg(
+            "pulid_flux requires the identity encoder — set LoadSpec::identity.encoder to the \
+             pulid_flux_v0.9.1.safetensors path"
+                .into(),
+        )
+    })?;
+    let eva_src = identity.eva.as_ref().ok_or_else(|| {
+        Error::Msg(
+            "pulid_flux requires the identity EVA tower — set LoadSpec::identity.eva to the \
+             converted EVA02-CLIP-L-14-336 .safetensors path"
+                .into(),
+        )
+    })?;
+    let face_src = identity.face_dir.as_ref().ok_or_else(|| {
+        Error::Msg(
+            "pulid_flux requires the identity face-analysis dir — set LoadSpec::identity.face_dir to \
+             the scrfd_10g / arcface_iresnet100 / bisenet_parsing weights dir"
+                .into(),
+        )
+    })?;
+    let encoder_path = spec_path(encoder, "encoder")?;
+    let eva_path = spec_path(eva_src, "eva")?;
+    let face_dir = spec_path(face_src, "face_dir")?;
+
+    // FLUX.1-dev backbone (its loader validates the snapshot dir). Q8/Q4 (sc-3076) composes for free:
+    // `spec.quantize` flows through `load_flux1`, quantizing ONLY the FLUX backbone linears. The PuLID
+    // conditioning (EVA tower, IDFormer, the 20 CA modules) stays f32 — it runs once per image, not
+    // per step, so the memory win is the backbone, and the f32 CA residual injects into the (still
+    // f32) DiT image stream unchanged. No quant-specific wiring needed here.
+    let identity_inventory = crate::memory_strategy::admitted_identity_inventory(spec)?;
+    let memory_strategy =
+        crate::memory_strategy::contract_with_inventory(spec, &identity_inventory)?;
+    identity_inventory.ensure_unchanged()?;
+    let flux = load_flux1(
+        FluxVariant::Dev,
+        &crate::memory_strategy::backbone_spec(spec),
+    )?;
+
+    // PuLID encoder + CA weights, cast f32 (conditioning path).
+    let mut pulid = Weights::from_file(encoder_path)?;
+    pulid.cast_all(Dtype::Float32)?;
+    identity_inventory.ensure_unchanged()?;
+
+    // EVA-CLIP tower (f32).
+    let eva = load_eva(&eva_path)?;
+    identity_inventory.ensure_unchanged()?;
+
+    // Native face stack.
+    let face = FaceAnalysis::load(
+        &Weights::from_file(face_dir.join("scrfd_10g.safetensors"))?,
+        &Weights::from_file(face_dir.join("arcface_iresnet100.safetensors"))?,
+    )?
+    .with_parser(&Weights::from_file(
+        face_dir.join("bisenet_parsing.safetensors"),
+    )?)?;
+    identity_inventory.ensure_unchanged()?;
+
+    Ok(Box::new(PulidFlux::new_loaded(
+        flux,
+        eva,
+        pulid,
+        face,
+        spec.clone(),
+        memory_strategy,
+        identity_inventory,
+    )?))
+}
+
+// The registration constant bridges the crate's rich `Result` into backend-neutral
+// `gen_core::Result`. The `impl
+// Generator` above stays hand-written because `validate` adds a reference-face check beyond the
+// FLUX backbone's, so it is not the plain delegation `impl_generator!` expresses.
+mlx_gen::register_generators! {
+    pub(crate) const REGISTRATION = descriptor => load_pulid_flux
+}
+
+pub(crate) const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: MODEL_ID,
+    contract: crate::memory_strategy::contract_for,
+    safety_check: crate::memory_strategy::safety_check,
+};
+
+pub(crate) const MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: crate::memory_strategy::registered_fixture,
+        begin_request: crate::memory_strategy::registered_begin_request,
+    };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_gen::IdentityWeights;
+
+    /// The load error string, matched (not `unwrap_err` — `Box<dyn Generator>` isn't `Debug`).
+    fn load_err(spec: &LoadSpec) -> String {
+        match load_pulid_flux(spec) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected load_pulid_flux to error"),
+        }
+    }
+
+    /// sc-13664: the identity slot is **required** — an absent `LoadSpec::identity`, or an absent
+    /// `encoder` / `eva` / `face_dir` sub-field, is a **load-time** actionable error naming the slot,
+    /// resolved before any FLUX backbone I/O. No `PULID_*` env / HF-cache fallback.
+    #[test]
+    fn load_requires_identity_slot_and_every_subfield() {
+        // No identity slot at all — the actionable error names the slot (and confirms, for a migrating
+        // caller, that the historical `PULID_*` env fallback is gone).
+        let err = load_err(&LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/flux".into(),
+        )));
+        assert!(err.contains("requires the identity weights"), "got: {err}");
+        assert!(
+            !err.contains("PULID_FLUX_WEIGHTS"),
+            "the message must not resurrect the deleted env var as usable: {err}"
+        );
+
+        // Identity present but each sub-field missing in turn → named error for the missing one.
+        let base = |id: IdentityWeights| LoadSpec {
+            identity: Some(id),
+            ..LoadSpec::new(WeightsSource::Dir("/nonexistent/flux".into()))
+        };
+        let file = |p: &str| Some(WeightsSource::File(p.into()));
+        let dir = |p: &str| Some(WeightsSource::Dir(p.into()));
+
+        let no_encoder = base(IdentityWeights {
+            encoder: None,
+            eva: file("/x/eva.safetensors"),
+            face_dir: dir("/x/face"),
+        });
+        assert!(load_err(&no_encoder).contains("requires the identity encoder"));
+
+        let no_eva = base(IdentityWeights {
+            encoder: file("/x/pulid.safetensors"),
+            eva: None,
+            face_dir: dir("/x/face"),
+        });
+        assert!(load_err(&no_eva).contains("requires the identity EVA tower"));
+
+        let no_face = base(IdentityWeights {
+            encoder: file("/x/pulid.safetensors"),
+            eva: file("/x/eva.safetensors"),
+            face_dir: None,
+        });
+        assert!(load_err(&no_face).contains("requires the identity face-analysis dir"));
+    }
+
+    /// sc-13664: a set-but-nonexistent identity path errors up front with the spec-side message (the
+    /// `spec_path` existence check), naming the sub-field — not a bare later I/O error, no env var name.
+    #[test]
+    fn identity_encoder_nonexistent_path_errors_with_spec_message() {
+        let src = WeightsSource::File("/nonexistent/spec_pulid.safetensors".into());
+        let err = spec_path(&src, "encoder").unwrap_err().to_string();
+        assert!(err.contains("LoadSpec identity encoder"), "got: {err}");
+        assert!(err.contains("does not exist"), "got: {err}");
+    }
+
+    fn img() -> Image {
+        Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0u8; 3],
+        }
+    }
+
+    /// F-094: a single reference face is accepted (its strength becomes the id_weight, default 1.0).
+    #[test]
+    fn select_reference_accepts_single_reference() {
+        let cond = vec![Conditioning::Reference {
+            image: img(),
+            strength: Some(2.0),
+        }];
+        let (_, weight) = select_reference_face(&cond).unwrap();
+        assert_eq!(weight, 2.0);
+    }
+
+    /// F-094: a non-Reference conditioning (e.g. a stray Mask/Control) is rejected rather than
+    /// silently dropped when `generate` clears the conditioning.
+    #[test]
+    fn select_reference_rejects_unsupported_conditioning() {
+        let cond = vec![
+            Conditioning::Reference {
+                image: img(),
+                strength: None,
+            },
+            Conditioning::Mask { image: img() },
+        ];
+        let err = select_reference_face(&cond).unwrap_err().to_string();
+        assert!(err.contains("unsupported"), "got: {err}");
+    }
+
+    /// F-026: `validate` delegates to PuLID's OWN descriptor floor, which omits the `hyper` sampler
+    /// (PuLID doesn't load the dev Hyper LoRA). A `hyper` request must be rejected — not silently
+    /// rendered WITHOUT the LoRA the way the dev backbone descriptor would have allowed.
+    #[test]
+    fn own_descriptor_floor_rejects_hyper_sampler() {
+        let caps = descriptor().capabilities;
+        assert!(
+            !caps.samplers.contains(&"hyper"),
+            "PuLID's descriptor must omit the hyper sampler"
+        );
+        let base = GenerationRequest {
+            prompt: "a portrait".into(),
+            width: 1024,
+            height: 1024,
+            conditioning: vec![Conditioning::Reference {
+                image: img(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        // hyper is not advertised → typed Unsupported.
+        let hyper = GenerationRequest {
+            sampler: Some("hyper".into()),
+            ..base.clone()
+        };
+        assert!(matches!(
+            caps.validate_request(descriptor().id, &hyper),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+        // A curated sampler + PuLID's real-CFG knobs (true_cfg / negative_prompt) now validate, since
+        // the descriptor advertises them (sc-3075).
+        let ok = GenerationRequest {
+            sampler: Some("euler".into()),
+            true_cfg: Some(2.0),
+            negative_prompt: Some("blurry".into()),
+            ..base
+        };
+        assert!(
+            caps.validate_request(descriptor().id, &ok).is_ok(),
+            "curated sampler + real-CFG should pass PuLID's floor"
+        );
+    }
+
+    /// Zero *scalar* arrays for every listed key — the EVA/IdFormer constructors only clone the
+    /// required arrays (no shape validation at load), so scalars suffice for a tower that exists
+    /// but is never forwarded.
+    fn zero_weights(keys: Vec<String>) -> Weights {
+        let mut w = Weights::empty();
+        for k in keys {
+            w.insert(k, Array::from_f32(0.0));
+        }
+        w
+    }
+
+    /// A fully weight-free `PulidFlux`: the weightless FLUX-dev backbone
+    /// (`Flux1::new_for_tests`), a tiny zero-weight EVA tower + IdFormer, and the degenerate
+    /// `FaceAnalysis::new_for_tests` fixture. Constructible via struct literal because this tests
+    /// module is a child of `pulid_flux` (private fields in scope). Only the pre-weight `generate`
+    /// prefix (validate-first) may run — any forward would error on the zero-weight shapes.
+    fn weightless_pulid() -> PulidFlux {
+        // Tiny EVA tower (depth 1, 4-wide) — the constructor honors any EvaConfig (F-082).
+        let cfg = EvaConfig {
+            image_size: 2,
+            patch: 1,
+            embed_dim: 4,
+            depth: 1,
+            num_heads: 1,
+            proj_dim: 1,
+            pt_seq_len: 2,
+            rope_theta: 10000.0,
+            hidden_capture: vec![0],
+        };
+        let mut keys: Vec<String> = [
+            "patch_embed.proj.weight",
+            "patch_embed.proj.bias",
+            "cls_token",
+            "pos_embed",
+            "norm.weight",
+            "norm.bias",
+            "head.weight",
+            "head.bias",
+        ]
+        .map(String::from)
+        .to_vec();
+        keys.extend(
+            [
+                "norm1.weight",
+                "norm1.bias",
+                "norm2.weight",
+                "norm2.bias",
+                "attn.q_proj.weight",
+                "attn.q_bias",
+                "attn.k_proj.weight",
+                "attn.v_proj.weight",
+                "attn.v_bias",
+                "attn.inner_attn_ln.weight",
+                "attn.inner_attn_ln.bias",
+                "attn.proj.weight",
+                "attn.proj.bias",
+                "mlp.w1.weight",
+                "mlp.w1.bias",
+                "mlp.w2.weight",
+                "mlp.w2.bias",
+                "mlp.ffn_ln.weight",
+                "mlp.ffn_ln.bias",
+                "mlp.w3.weight",
+                "mlp.w3.bias",
+            ]
+            .iter()
+            .map(|l| format!("blocks.0.{l}")),
+        );
+        let eva = EvaVisionTransformer::from_weights(&zero_weights(keys), "", cfg).unwrap();
+
+        // IdFormer with depth 0 — no perceiver layers; just latents/proj_out + the 6 mapping MLPs.
+        let mlp = [
+            "0.weight", "0.bias", "1.weight", "1.bias", "3.weight", "3.bias", "4.weight", "4.bias",
+            "6.weight", "6.bias",
+        ];
+        let mut ikeys: Vec<String> = vec!["enc.latents".into(), "enc.proj_out".into()];
+        for m in [
+            "id_embedding_mapping",
+            "mapping_0",
+            "mapping_1",
+            "mapping_2",
+            "mapping_3",
+            "mapping_4",
+        ] {
+            ikeys.extend(mlp.iter().map(|l| format!("enc.{m}.{l}")));
+        }
+        let idformer = IdFormer::from_weights(
+            &zero_weights(ikeys),
+            "enc",
+            IdFormerConfig {
+                depth: 0,
+                ..IdFormerConfig::default()
+            },
+        )
+        .unwrap();
+
+        let flux = Flux1::new_for_tests(FluxVariant::Dev);
+        let mut memory_strategy = flux.memory_strategy_contract().unwrap().clone();
+        memory_strategy.provider_id = MODEL_ID.into();
+        memory_strategy.calibration = None;
+        PulidFlux {
+            descriptor: descriptor(),
+            flux,
+            eva,
+            idformer,
+            pulid: Weights::empty(),
+            face: FaceAnalysis::new_for_tests().unwrap(),
+            memory_strategy,
+            loaded_spec: LoadSpec::new(WeightsSource::Dir("/weightless-pulid".into())),
+            identity_inventory: None,
+        }
+    }
+
+    /// F-011 (sc-12463): `generate_impl` self-validates FIRST (`self.validate(req)?`, the sibling
+    /// convention — chroma/svd/ideogram), so a caller that invokes `generate` WITHOUT a prior
+    /// `validate` still gets the typed `Unsupported` for a `hyper` request instead of a silently
+    /// degraded render (the FLUX-dev backbone would happily render WITHOUT the Hyper-FLUX LoRA
+    /// PuLID never loads). Driven end-to-end through `Generator::generate` on a weight-free
+    /// instance: the capability floor rejects the request before any face/EVA/backbone work, so no
+    /// weights are ever touched. Mutation-pins the regression — with the `self.validate(req)?` line
+    /// deleted, `generate` falls through into the zero-weight identity stack and fails with a
+    /// non-`Unsupported` error, so this test FAILS.
+    #[test]
+    fn generate_without_prior_validate_rejects_hyper_typed_unsupported() {
+        let model = weightless_pulid();
+        let req = GenerationRequest {
+            prompt: "a portrait".into(),
+            width: 1024,
+            height: 1024,
+            sampler: Some("hyper".into()),
+            conditioning: vec![Conditioning::Reference {
+                image: img(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        // The reference-face half of `validate` accepts this request, so the sampler floor is the
+        // ONLY rejection — and it must arrive through `generate` itself, typed.
+        assert!(select_reference_face(&req.conditioning).is_ok());
+        let err = Generator::generate(&model, &req, &mut |_| {}).unwrap_err();
+        assert!(
+            matches!(err, gen_core::Error::Unsupported(_)),
+            "got: {err:?}"
+        );
+    }
+
+    /// Two reference faces are rejected, and an empty request is rejected as missing.
+    #[test]
+    fn select_reference_rejects_multiple_and_missing() {
+        let two = vec![
+            Conditioning::Reference {
+                image: img(),
+                strength: None,
+            },
+            Conditioning::Reference {
+                image: img(),
+                strength: None,
+            },
+        ];
+        assert!(select_reference_face(&two)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one"));
+        assert!(select_reference_face(&[])
+            .unwrap_err()
+            .to_string()
+            .contains("required"));
+    }
+}

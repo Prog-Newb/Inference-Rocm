@@ -1,0 +1,44 @@
+[package]
+name = "candle-audio-moss-tts"
+version = "0.0.0"
+edition = "2021"
+description = "MOSS-TTSD multi-speaker dialogue-TTS provider for the SceneWorks Candle audio lane (sc-13360 + sc-13518) — an autoregressive Qwen3 backbone (MOSS-TTSD-v0.5) emitting 8-channel delay-pattern RVQ speech-codebook frames, plus the natively-ported OpenMOSS XY_Tokenizer decoder (8 RVQ quantizers -> post-RVQ adapter -> upsample -> acoustic decoder -> ConvNeXt/ISTFT vocos) that renders those frames into a 24 kHz waveform. generate() produces a real multi-speaker AudioTrack (torch-parity cosine 0.99999994 on the codec) and the provider is registered into the shipping catalog."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["candle", "audio", "tts", "dialogue", "rvq"]
+categories = ["science"]
+
+[dependencies]
+# Shared candle audio commons (device seam, pinned-SHA hub resolution, WAV encode, AudioError
+# bridge). Re-exports `gen_core` and `candle_core`, so this crate resolves the SAME candle build +
+# gen-core rev as the catalog it will register into once the codec lands.
+candle-audio = { path = "../candle-audio" }
+# candle-nn at the workspace's pinned candle revision (Linear/RmsNorm/Embedding/VarBuilder — the
+# Qwen3 backbone is built from these primitives).
+candle-nn = { workspace = true }
+# Snapshot-preparer contract types for the audio-lane MOSS-TTSD-aware preparer probe.
+core-llm = { workspace = true }
+# The Qwen tokenizer (`tokenizer.json` in the pinned snapshot). Workspace pin — the 0.22 side of the
+# intentional tokenizers 0.21/0.22 split (check-workspace.py).
+tokenizers = { workspace = true }
+# Config parsing (config.json: the flat MOSS-TTSD config — Qwen3 backbone dims + channel/speech ids).
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }
+# The backend-neutral audio-generator conformance suite (multi-speaker gate, seed determinism).
+sceneworks-gen-core-testkit = { workspace = true }
+# The Chatterbox voice encoder — the acoustic multi-speaker DoD measures cross-segment vs
+# self-segment speaker-embedding cosine to prove the two speakers render in DIFFERENT voices.
+candle-audio-chatterbox-ve = { path = "../candle-audio-chatterbox-ve" }
+
+[features]
+default = []
+# Apple Metal GPU backend — forwarded to the shared audio commons. Not in `default`.
+metal = ["candle-audio/metal", "candle-nn/metal"]
+# NVIDIA CUDA backend — forwarded to the shared audio commons. Not in `default`.
+cuda = ["candle-audio/cuda", "candle-nn/cuda"]
