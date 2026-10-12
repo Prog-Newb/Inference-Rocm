@@ -3399,7 +3399,9 @@ name = "runtime-rocm"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-catalog",
  "candle-gen-seedvr2",
+ "candle-llm",
  "runtime-catalog",
 ]
 

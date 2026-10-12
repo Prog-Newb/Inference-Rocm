@@ -301,7 +301,18 @@ impl Seedvr2Pipeline {
             return self.generate_tiled(image, width, height, seed, softness, safe_gib, cancel);
         }
 
-        let processed = self.preprocess(image, width, height, softness)?; // (1,3,H,W)
+        // Pad output dims to the nearest multiple of VAE_SCALE (= spatial-downscale 8
+        // × DiT patch 2 = 16) before encoding. Non-multiple inputs cause an integer-
+        // truncation mismatch in the DiT patch-embedding reshape (e.g. 1422/8 = 177.75
+        // truncated to 177, which is odd and cannot be split by patch_h=2).
+        // decode_crop already accepts the true (caller-supplied) height/width and uses
+        // Tensor::narrow to strip the padding rows/columns from the decoded output, so
+        // callers always receive exactly the dimensions they requested.
+        let vae_scale = crate::config::VAE_SCALE as usize;
+        let pad_h = ((height + vae_scale - 1) / vae_scale) * vae_scale;
+        let pad_w = ((width  + vae_scale - 1) / vae_scale) * vae_scale;
+
+        let processed = self.preprocess(image, pad_w, pad_h, softness)?; // (1,3,pad_h,pad_w)
         let latent = self.vae.encode(&processed)?;
         let (_b, _c, lt, lh, lw) = latent.dims5()?;
         let noise = seeded_normal5(seed, (1, 16, lt, lh, lw), self.dtype, &self.device)?;
@@ -310,9 +321,14 @@ impl Seedvr2Pipeline {
 
         crate::debug::probe("latents (post-denoise)", &latents)?;
 
-        let decoded = self.decode_crop(&latents, height, width)?; // (1,3,H,W)
+        // decode_crop crops to the TRUE (unpadded) output size via Tensor::narrow.
+        let decoded = self.decode_crop(&latents, height, width)?; // (1,3,height,width)
 
         crate::debug::probe("decoded", &decoded)?;
+
+        // Crop `processed` to the same true dims for color correction; the padded border
+        // pixels are blank-extended content that would skew the luminance histogram.
+        let processed_true = processed.narrow(2, 0, height)?.narrow(3, 0, width)?;
 
         let skip_color = std::env::var("SEEDVR2_SKIP_COLOR")
             .map(|v| v == "1")
@@ -323,7 +339,7 @@ impl Seedvr2Pipeline {
         } else {
             let corrected = color::apply_color_correction(
                 &decoded.to_dtype(DType::F32)?,
-                &processed.to_dtype(DType::F32)?,
+                &processed_true.to_dtype(DType::F32)?,
                 LUMINANCE_WEIGHT,
             )?;
 
