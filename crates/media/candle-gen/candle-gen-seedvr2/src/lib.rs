@@ -299,9 +299,25 @@ fn load_with(spec: &LoadSpec, id: &'static str) -> gen_core::Result<Box<dyn Gene
     let device = candle_gen::default_device()?;
     // Precision::Bf16 is the "native dense" sentinel → bf16 on GPU, f32 on CPU (the parity dtype);
     // Fp32 forces full precision everywhere.
+    //
+    // ROCm takes f16, NOT bf16. The shipped checkpoint is fp16
+    // (`seedvr2_ema_3b_fp16.safetensors`); bf16 carries 7 explicit mantissa bits to fp16's 10,
+    // so loading those weights as bf16 throws away precision on every one of them. The run
+    // still completes, reports no NaN and is bit-reproducible — the output is just visibly
+    // destroyed, with all high-frequency detail smeared away.
+    //
+    // Measured on gfx1100: same build, same 360x360 input, only SEEDVR2_DTYPE differing
+    // (`tests/rocm_real_image.rs`):
+    //   f16  -> 980,843 B  md5 E6CA6EE2FE92B273C8B0210DDF1D25C8  — byte-identical to the
+    //           known-good reference captured before the bf16 kernels landed
+    //   bf16 -> 416,110 B  md5 ED71483BF958A74688F116BFBE35E898  — blurred mush
+    //
+    // Scoped to ROCm on purpose: CUDA/Metal are untested here, and the cuda smokes describe
+    // bf16 as the intended worker dtype on that lane, so they keep their current behaviour.
     let dtype = match spec.precision {
         Precision::Fp32 => DType::F32,
         Precision::Bf16 if device.is_cpu() => DType::F32,
+        Precision::Bf16 if device.is_rocm() => DType::F16,
         Precision::Bf16 => DType::BF16,
     };
     let (dit_file, cfg) = variant(id);
