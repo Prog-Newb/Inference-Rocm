@@ -308,6 +308,122 @@ pub fn plan_spatial_tile_px(weights_bytes: usize, safe_gib: f64) -> i32 {
     edge.clamp(MIN_TILE_PX, VAE_SAFE_DECODE_EDGE_PX)
 }
 
+/// Tile **area** budget (px²) — the same cost model as [`plan_spatial_tile_px`] without forcing the
+/// tile to be square. `plan_spatial_tile_px` returns `sqrt` of this (clamped), which is what made the
+/// tiler square; the shape is a free choice and a square one is usually the wrong choice.
+pub fn plan_spatial_tile_area_px2(weights_bytes: usize, safe_gib: f64) -> f64 {
+    let weights_gib = weights_bytes as f64 / GIB;
+    let avail = (safe_gib - weights_gib).max(0.0);
+    let by_memory = avail / (GB_PER_MPX_FRAME * 1e-6); // = tile_h · tile_w (px²)
+    // Never below the area the square floor would have allowed, so a tight budget still produces a
+    // plan rather than nothing (peak is bounded by the per-edge VAE cap in either case).
+    by_memory.max((MIN_TILE_PX as f64) * (MIN_TILE_PX as f64))
+}
+
+/// Tile edge (px) for an `n`-px axis cut into `count` windows that overlap by at least `overlap`,
+/// aligned up to [`SPATIAL_ALIGN`] and capped at `cap`. `None` when no legal edge exists.
+///
+/// `count` windows of `t` px overlapping by `≥ overlap` need `t · count ≥ n + overlap · (count-1)`.
+/// Satisfying that is also exactly what makes the even start distribution in [`tile_axis_sized`]
+/// land every adjacent pair at least `overlap` px apart, so the feather always has something to
+/// blend over.
+fn axis_tile_px(n: i32, count: i32, overlap: i32, cap: i32) -> Option<i32> {
+    if count <= 1 {
+        return if n <= cap { Some(n) } else { None };
+    }
+    let need = (n + (count - 1) * overlap + count - 1) / count; // ceil
+    let t = ((need + SPATIAL_ALIGN - 1) / SPATIAL_ALIGN * SPATIAL_ALIGN).min(n);
+    if t > cap || t < MIN_TILE_PX {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+/// `count` windows of `tile` px over an `n`-px axis, first at 0, last ending at `n`, intermediate
+/// starts distributed evenly. Same placement rule as [`tile_axis`]; the size is supplied rather than
+/// assumed equal to the budget edge.
+fn tile_axis_sized(n: i32, tile: i32, count: i32) -> Vec<(i32, i32)> {
+    if count <= 1 || tile >= n {
+        return vec![(0, n)];
+    }
+    let last_start = n - tile;
+    (0..count)
+        .map(|i| {
+            let start = i * last_start / (count - 1);
+            (start, start + tile)
+        })
+        .collect()
+}
+
+/// **Rectangular** spatial-tile grid: the tile count per axis is chosen to minimise the total number
+/// of pixels the model has to run over, subject to the memory area budget and the per-edge VAE
+/// correctness cap ([`VAE_SAFE_DECODE_EDGE_PX`]).
+///
+/// This replaces square tiling on the production paths, and the difference is not marginal. A
+/// 2560×1440 frame under a 1376-px square budget needs `ceil(2560/1376) = 2` columns **and**
+/// `ceil(1440/1376) = 2` rows, because the frame is 64 px taller than the tile — four 1376²
+/// tiles, 7.57 Mpx of work for a 3.69 Mpx frame, with the two row-tiles overlapping by 1312 of
+/// their 1376 rows. The same frame as 1×2 tiles of 1440×1312 is 3.78 Mpx: **2.0× less work, and
+/// half as many tiles** (each tile also carries a large fixed cost, so the count matters on its own).
+///
+/// Ties go to the plan with fewer tiles for that reason. Returns `(tiles, tile_h, tile_w)`; falls
+/// back to the square planner if the budget and cap admit nothing, so a caller always gets a plan.
+pub fn plan_spatial_tiles_rect(
+    h: i32,
+    w: i32,
+    max_area_px2: f64,
+    overlap: i32,
+) -> (Vec<SpatialTile>, i32, i32) {
+    let cap = VAE_SAFE_DECODE_EDGE_PX;
+    let max_ny = ((h + MIN_TILE_PX - 1) / MIN_TILE_PX).max(1);
+    let max_nx = ((w + MIN_TILE_PX - 1) / MIN_TILE_PX).max(1);
+
+    let mut best: Option<(i64, i32, i32, i32, i32)> = None; // (px cost, ny, nx, th, tw)
+    for ny in 1..=max_ny {
+        let Some(th) = axis_tile_px(h, ny, overlap, cap) else {
+            continue;
+        };
+        for nx in 1..=max_nx {
+            let Some(tw) = axis_tile_px(w, nx, overlap, cap) else {
+                continue;
+            };
+            if (th as f64) * (tw as f64) > max_area_px2 {
+                continue;
+            }
+            let cost = (ny as i64) * (nx as i64) * (th as i64) * (tw as i64);
+            let tiles = (ny as i64) * (nx as i64);
+            let better = match best {
+                None => true,
+                Some((bc, bny, bnx, _, _)) => {
+                    cost < bc || (cost == bc && tiles < (bny as i64) * (bnx as i64))
+                }
+            };
+            if better {
+                best = Some((cost, ny, nx, th, tw));
+            }
+        }
+    }
+
+    let Some((_cost, ny, nx, th, tw)) = best else {
+        // Nothing legal — e.g. an axis shorter than MIN_TILE_PX against a cap that cannot cover it.
+        // Degrade to the old square planner rather than returning an empty plan.
+        let edge = (max_area_px2.max(0.0).sqrt() as i32 / SPATIAL_ALIGN * SPATIAL_ALIGN)
+            .clamp(MIN_TILE_PX, cap);
+        return (plan_spatial_tiles(h, w, edge, overlap), edge, edge);
+    };
+
+    let ys = tile_axis_sized(h, th, ny);
+    let xs = tile_axis_sized(w, tw, nx);
+    let mut out = Vec::with_capacity(ys.len() * xs.len());
+    for &(y0, y1) in &ys {
+        for &(x0, x1) in &xs {
+            out.push(SpatialTile { y0, y1, x0, x1 });
+        }
+    }
+    (out, th, tw)
+}
+
 /// Per-pixel feather weights `(th·tw)` for a tile, tapering linearly to ~0 over `overlap` px on each
 /// edge abutting a neighbor (`fade_*`) and staying 1 at outer image edges. Separable: `w = ry·rx`.
 /// Assembly divides by the accumulated weight, so exact partition-of-unity isn't required.
@@ -544,6 +660,98 @@ mod tests {
             .collect();
         assert_eq!(xs, vec![0, 1040, 2080]);
     }
+    /// The case that cost 2× on a real 720p→1440p job: a frame only *slightly* taller than the
+    /// square budget edge. Square tiling pays for a second full row of tiles to cover 64 px.
+    #[test]
+    fn rect_plan_beats_square_on_a_1440p_frame() {
+        let (h, w, edge, ov) = (1440, 2560, 1376, SPATIAL_OVERLAP);
+        let area = (edge as f64) * (edge as f64);
+
+        let square = plan_spatial_tiles(h, w, edge, ov);
+        let square_px: i64 = square
+            .iter()
+            .map(|t| ((t.y1 - t.y0) as i64) * ((t.x1 - t.x0) as i64))
+            .sum();
+        assert_eq!(square.len(), 4, "square planner needs 2×2 here");
+
+        let (rect, th, tw) = plan_spatial_tiles_rect(h, w, area, ov);
+        let rect_px: i64 = rect
+            .iter()
+            .map(|t| ((t.y1 - t.y0) as i64) * ((t.x1 - t.x0) as i64))
+            .sum();
+
+        assert_eq!(rect.len(), 2, "one row of two tiles covers this frame");
+        assert_eq!((th, tw), (1440, 1312));
+        assert!(
+            (th as f64) * (tw as f64) <= area,
+            "tile must still fit the memory budget"
+        );
+        assert!(
+            rect_px * 2 <= square_px,
+            "expected ≥2× less work: rect={rect_px} square={square_px}"
+        );
+    }
+
+    /// Whatever the plan, it must cover the frame and keep every edge inside the VAE cap.
+    #[test]
+    fn rect_plan_covers_frame_and_respects_caps() {
+        let ov = SPATIAL_OVERLAP;
+        for (h, w) in [
+            (1440, 2560),
+            (2160, 3840),
+            (1080, 1920),
+            (4096, 4096),
+            (720, 720),
+            (2804, 2244),
+        ] {
+            for edge in [768, 1072, 1376, VAE_SAFE_DECODE_EDGE_PX] {
+                let area = (edge as f64) * (edge as f64);
+                let (plan, th, tw) = plan_spatial_tiles_rect(h, w, area, ov);
+                assert!(!plan.is_empty(), "{h}×{w} @ {edge}: empty plan");
+                assert!(
+                    th <= VAE_SAFE_DECODE_EDGE_PX && tw <= VAE_SAFE_DECODE_EDGE_PX,
+                    "{h}×{w} @ {edge}: tile {th}×{tw} exceeds the VAE cap"
+                );
+                assert!(plan.iter().any(|t| t.y0 == 0 && t.x0 == 0));
+                assert_eq!(plan.iter().map(|t| t.y1).max(), Some(h), "{h}×{w} @ {edge}");
+                assert_eq!(plan.iter().map(|t| t.x1).max(), Some(w), "{h}×{w} @ {edge}");
+
+                // Adjacent tiles along each axis overlap by at least `ov` (or the axis is one tile).
+                let mut ys: Vec<_> = plan.iter().map(|t| (t.y0, t.y1)).collect();
+                ys.sort_unstable();
+                ys.dedup();
+                for pair in ys.windows(2) {
+                    assert!(
+                        pair[0].1 - pair[1].0 >= ov,
+                        "{h}×{w} @ {edge}: rows {:?} overlap < {ov}",
+                        pair
+                    );
+                }
+            }
+        }
+    }
+
+    /// The rect planner never does *more* work than the square planner it replaces.
+    #[test]
+    fn rect_plan_never_worse_than_square() {
+        let ov = SPATIAL_OVERLAP;
+        for (h, w) in [(1440, 2560), (2160, 3840), (1996, 3152), (4096, 4096)] {
+            for edge in [1072, 1376, VAE_SAFE_DECODE_EDGE_PX] {
+                let area = (edge as f64) * (edge as f64);
+                let sq: i64 = plan_spatial_tiles(h, w, edge, ov)
+                    .iter()
+                    .map(|t| ((t.y1 - t.y0) as i64) * ((t.x1 - t.x0) as i64))
+                    .sum();
+                let (plan, _, _) = plan_spatial_tiles_rect(h, w, area, ov);
+                let rc: i64 = plan
+                    .iter()
+                    .map(|t| ((t.y1 - t.y0) as i64) * ((t.x1 - t.x0) as i64))
+                    .sum();
+                assert!(rc <= sq, "{h}×{w} @ {edge}: rect {rc} > square {sq}");
+            }
+        }
+    }
+
     #[test]
     fn spatial_tile_px_budget_scales() {
         let wb = (7.3 * GIB) as usize;

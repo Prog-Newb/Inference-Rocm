@@ -29,6 +29,43 @@ use crate::{color, convert};
 /// Post-decode color-correction luminance weight (the reference `apply_color_correction` default).
 const LUMINANCE_WEIGHT: f32 = 0.8;
 
+/// Wall-clock stage splits for one spatial tile, printed as `[seedvr2-tile-time]`.
+///
+/// Each [`Self::lap`] synchronizes the device first. Without that the numbers are meaningless on a
+/// GPU backend: kernel launches return immediately, so the time for a stage lands on whichever later
+/// call happens to block, and the breakdown reads as "decode is everything". The sync costs nothing
+/// relative to a stage measured in seconds, and the tile loop is already the coarse unit here.
+struct Stage<'a> {
+    device: &'a Device,
+    last: std::time::Instant,
+    start: std::time::Instant,
+}
+
+impl<'a> Stage<'a> {
+    fn new(device: &'a Device) -> Self {
+        let _ = device.synchronize();
+        let now = std::time::Instant::now();
+        Self {
+            device,
+            last: now,
+            start: now,
+        }
+    }
+
+    /// Seconds since the previous lap (or construction), with the device drained first.
+    fn lap(&mut self) -> f64 {
+        let _ = self.device.synchronize();
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(self.last).as_secs_f64();
+        self.last = now;
+        dt
+    }
+
+    fn total(&self) -> f64 {
+        self.last.duration_since(self.start).as_secs_f64()
+    }
+}
+
 pub struct Seedvr2Pipeline {
     pub vae: Seedvr2Vae,
     pub transformer: Seedvr2Transformer,
@@ -656,51 +693,70 @@ impl Seedvr2Pipeline {
     ) -> CResult<Tensor> {
         let (_b, _c, _t, height, width) = processed.dims5()?; // (1,3,1,H,W)
         let (h_i, w_i) = (height as i32, width as i32);
-        let plan = video::plan_spatial_tiles(h_i, w_i, tile, overlap);
+
+        // `tile` is the square-equivalent budget edge; what the budget actually bounds is tile
+        // *area*, and letting the shape follow the frame is worth ~2× on near-square frames
+        // (see `video::plan_spatial_tiles_rect`).
+        let max_area = (tile as f64) * (tile as f64);
+        let (plan, th_px, tw_px) = video::plan_spatial_tiles_rect(h_i, w_i, max_area, overlap);
+        let planned_px: i64 = plan
+            .iter()
+            .map(|t| ((t.y1 - t.y0) as i64) * ((t.x1 - t.x0) as i64))
+            .sum();
+        let frame_px = (h_i as i64) * (w_i as i64);
         eprintln!(
-            "[seedvr2-tile-plan] frame={}x{} tile={} requested_overlap={} tiles={}",
+            "[seedvr2-tile-plan] frame={}x{} budget_edge={} tile={}x{} overlap={} tiles={} work={:.2}x frame",
             h_i,
             w_i,
             tile,
+            th_px,
+            tw_px,
             overlap,
-            plan.len()
+            plan.len(),
+            planned_px as f64 / frame_px.max(1) as f64
         );
 
         for (i, t) in plan.iter().enumerate() {
-             eprintln!(
-                 "[seedvr2-tile-plan] #{:02} y={}..{} x={}..{} size={}x{}",
-                 i,
-                 t.y0,
-                 t.y1,
-                 t.x0,
-                 t.x1,
-                 t.y1 - t.y0,
-                 t.x1 - t.x0
-             );
-    }
+            eprintln!(
+                "[seedvr2-tile-plan] #{:02} y={}..{} x={}..{} size={}x{}",
+                i,
+                t.y0,
+                t.y1,
+                t.x0,
+                t.x1,
+                t.y1 - t.y0,
+                t.x1 - t.x0
+            );
+        }
 
         let mut acc: Option<Tensor> = None; // (1,3,1,H,W)
         let mut wsum: Option<Tensor> = None; // (1,1,1,H,W)
-                                             // `for_each_tile` checks the cancel flag before each (seconds-to-minutes) tile.
+        let mut tile_no = 0usize;
+        // `for_each_tile` checks the cancel flag before each (seconds-to-minutes) tile.
         for_each_tile(&plan, cancel, |t| {
             let (th, tw) = ((t.y1 - t.y0) as usize, (t.x1 - t.x0) as usize);
             let (y0, x0) = (t.y0 as usize, t.x0 as usize);
+            let mut stage = Stage::new(&self.device);
             let tile_clip = processed.narrow(3, y0, th)?.narrow(4, x0, tw)?; // (1,3,1,th,tw)
 
             crate::debug::probe("tile input", &tile_clip)?;
 
             // full model path on the tile (one-step Euler), same noise per tile.
             let latent = self.vae.encode(&tile_clip)?;
+            let t_encode = stage.lap();
 
             crate::debug::probe("tile VAE latent", &latent)?;
             let (_b, _c, lt, lh, lw) = latent.dims5()?;
             let noise = seeded_normal5(seed, (1, 16, lt, lh, lw), self.dtype, &self.device)?;
             let cond = Self::condition(&latent)?;
+            let t_noise = stage.lap();
             let latents = self.denoise(&noise, &cond)?;
+            let t_denoise = stage.lap();
 
             crate::debug::probe("tile latents (post-denoise)", &latents)?;
 
             let decoded = self.decode_crop_5d(&latents, th, tw)?;
+            let t_decode = stage.lap();
 
             crate::debug::probe("tile decoded", &decoded)?;
 
@@ -734,6 +790,20 @@ impl Seedvr2Pipeline {
                 Some(a) => a.add(&wpad)?,
                 None => wpad,
             });
+            let t_blend = stage.lap();
+            eprintln!(
+                "[seedvr2-tile-time] #{:02} {}x{} encode={:.2}s noise={:.2}s dit={:.2}s decode={:.2}s blend={:.2}s total={:.2}s",
+                tile_no,
+                th,
+                tw,
+                t_encode,
+                t_noise,
+                t_denoise,
+                t_decode,
+                t_blend,
+                stage.total()
+            );
+            tile_no += 1;
             Ok(())
         })?;
 
