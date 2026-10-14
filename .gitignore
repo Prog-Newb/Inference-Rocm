@@ -15,3 +15,10 @@ __pycache__/
 # tree — including `src/` — where the file is real source: it would build for its author and be
 # missing, silently, from every other checkout.
 **/tests/*_scratch.rs
+
+# ROCm bring-up scratch inside the SeedVR2 crate. The smoke harnesses are run as
+# `cargo test ... --nocapture` redirected to a file, with the pid parked beside it
+# so a later turn can kill a run that outlives its MCP call (HANDOFF.md Section 7).
+# None of it is source; all of it lands in the crate dir.
+/crates/media/candle-gen/candle-gen-seedvr2/*.log
+/crates/media/candle-gen/candle-gen-seedvr2/*.pid
