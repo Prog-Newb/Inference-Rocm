@@ -202,7 +202,9 @@ impl Upsample3d {
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (b, c, t, h, wd) = x.dims5()?;
+        let mut st = crate::debug::StageTimer::new(x.device());
         let x = self.upscale_conv.forward(x)?; // (B, C·sf²·tf, T, H, W)
+        st.lap("upscale_conv", &x);
         let (sf, tf) = (self.sf, self.tf);
         // (B, sf, sf, tf, C, T, H, W) -> (B, C, T, tf, H, sf, W, sf) -> (B, C, T·tf, H·sf, W·sf)
         let x = x
@@ -210,12 +212,16 @@ impl Upsample3d {
             .permute([0usize, 4, 5, 3, 6, 1, 7, 2])?
             .contiguous()?
             .reshape((b, c, t * tf, h * sf, wd * sf))?;
+        st.lap("shuffle", &x);
         let x = if t == 1 && tf > 1 {
             x.narrow(2, 0, 1)?
         } else {
             x
         };
-        self.conv.forward(&x)
+        let out = self.conv.forward(&x)?;
+        st.lap("conv", &out);
+        st.report("  upsample");
+        Ok(out)
     }
 }
 
@@ -420,10 +426,14 @@ impl Decoder3d {
         })
     }
     fn forward(&self, z: &Tensor) -> Result<Tensor> {
+        let mut t = crate::debug::StageTimer::new(z.device());
         let mut h = self.conv_in.forward(z)?;
+        t.lap("conv_in", &h);
         h = self.mid.forward(&h)?;
-        for u in &self.up_blocks {
+        t.lap("mid", &h);
+        for (i, u) in self.up_blocks.iter().enumerate() {
             h = u.forward(&h)?;
+            t.lap(&format!("up{i}"), &h);
         }
         h = gn(
             &h,
@@ -432,7 +442,12 @@ impl Decoder3d {
             self.groups,
             self.eps,
         )?;
-        self.conv_out.forward(&nn::silu(&h)?)
+        let h = nn::silu(&h)?;
+        t.lap("norm_out+silu", &h);
+        let out = self.conv_out.forward(&h)?;
+        t.lap("conv_out", &out);
+        t.report("decode");
+        Ok(out)
     }
 }
 
