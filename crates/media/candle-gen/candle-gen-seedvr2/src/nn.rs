@@ -31,27 +31,63 @@ pub fn transpose_weight(w: &Tensor) -> Result<Tensor> {
     w.t()?.contiguous()
 }
 
+/// Cached identity alpha/beta for the fused [`group_norm`] call, keyed by row length.
+///
+/// `candle_nn::ops::layer_norm` takes a per-element alpha/beta over the normalised axis, while
+/// GroupNorm's affine is per *channel*. So the fused call gets identity vectors and the real affine
+/// is applied after. Building a 7.5M-element vector per call would undo the saving; these are built
+/// once per distinct length.
+static LN_IDENTITY: std::sync::Mutex<Option<std::collections::HashMap<usize, (Tensor, Tensor)>>> =
+    std::sync::Mutex::new(None);
+
+fn ln_identity(len: usize, dev: &candle_gen::candle_core::Device) -> Result<(Tensor, Tensor)> {
+    if let Ok(guard) = LN_IDENTITY.lock() {
+        if let Some(found) = guard.as_ref().and_then(|m| m.get(&len)) {
+            if found.0.device().same_device(dev) {
+                return Ok((found.0.clone(), found.1.clone()));
+            }
+        }
+    }
+    let ones = Tensor::ones(len, DType::F32, dev)?;
+    let zeros = Tensor::zeros(len, DType::F32, dev)?;
+    if let Ok(mut guard) = LN_IDENTITY.lock() {
+        guard
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(len, (ones.clone(), zeros.clone()));
+    }
+    Ok((ones, zeros))
+}
+
 /// GroupNorm over `[N, C, *spatial]` (channels in dim 1, any trailing rank), computed in f32 with a
-/// learnable `[C]` weight/bias. Matches mlx's channels-last f32 GroupNorm bit-for-bit at f32.
+/// learnable `[C]` weight/bias.
+///
+/// The centre-and-scale step goes through the **fused** `layer_norm` kernel: GroupNorm over
+/// `[N*groups, len]` is exactly a LayerNorm over that last axis, and the hand-rolled form was five
+/// full-tensor passes over a 967 MB f32 tensor whose reduction produced only `N*groups` outputs.
+///
+/// Note this is a real numerical change, not a reassociation: the kernel computes variance as
+/// `E[x^2] - mu^2` (reduce.hip:443), where the hand-rolled version used the better-conditioned
+/// two-pass `mean((x-mu)^2)`. Validated by PSNR/SSIM against the previous build, not by timing alone.
 pub fn group_norm(x: &Tensor, w: &Tensor, b: &Tensor, groups: usize, eps: f64) -> Result<Tensor> {
     let sh = x.dims().to_vec();
     let (n, c) = (sh[0], sh[1]);
     let rest: usize = sh[2..].iter().product();
     let dt = x.dtype();
+    let len = (c / groups) * rest;
     let xf = x.to_dtype(DType::F32)?;
-    let g = xf.reshape((n, groups, (c / groups) * rest))?;
-    let mean = g.mean_keepdim(2)?;
-    let centered = g.broadcast_sub(&mean)?;
-    let var = centered.sqr()?.mean_keepdim(2)?;
-    let normed = centered
-        .broadcast_div(&var.affine(1.0, eps)?.sqrt()?)?
-        .reshape(sh.clone())?;
-    // affine: reshape [C] → [1, C, 1, …] to broadcast over the trailing dims.
+    let g = xf.reshape((n * groups, len))?;
+    let (ones, zeros) = ln_identity(len, g.device())?;
+    let normed = candle_gen::candle_nn::ops::layer_norm(&g, &ones, &zeros, eps as f32)?;
+    // affine: reshape [C] -> [1, C, 1, ...] to broadcast over the trailing dims.
     let mut ws = vec![1usize; sh.len()];
     ws[1] = c;
     let wv = w.to_dtype(DType::F32)?.reshape(ws.clone())?;
     let bv = b.to_dtype(DType::F32)?.reshape(ws)?;
-    normed.broadcast_mul(&wv)?.broadcast_add(&bv)?.to_dtype(dt)
+    normed
+        .reshape(sh)?
+        .broadcast_mul(&wv)?
+        .broadcast_add(&bv)?
+        .to_dtype(dt)
 }
 
 /// RMSNorm over the last dim with a `[dim]` weight, computed in f32.
