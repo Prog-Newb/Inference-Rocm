@@ -12,7 +12,7 @@
 //! (candle conv2d takes one symmetric padding/stride); the asymmetric `(0,1)` downsample pad is added
 //! by the caller (`vae::Downsample3d`) before the conv, exactly like the reference.
 
-use candle_gen::candle_core::{Device, Result, Tensor};
+use candle_gen::candle_core::{DType, Device, Result, Tensor};
 
 use crate::weights::Weights;
 
@@ -122,8 +122,19 @@ fn row_chunked_conv2d(
 }
 
 pub struct CausalConv3d {
-    weight: Tensor, // [O, I, kT, kH, kW]
-    bias: Tensor,   // [1, O, 1, 1, 1]
+    /// Per-temporal-tap conv2d kernels: `kT` × `[O, I, kH, kW]`, contiguous, on the compute device.
+    ///
+    /// Sliced **once, at load**. These used to be re-derived inside `forward`, per tap, by sending the
+    /// whole 5-D weight to the CPU, narrowing it there and uploading the slice back — a workaround for
+    /// candle-rocm mishandling offset `narrow` views (the same bug `chunked_conv2d` documents). The
+    /// workaround was right; its placement was not. A 512→512 3×3×3 weight is ~14 MB, so each conv was
+    /// moving ~42 MB host⇄device and forcing three full device syncs, on every tile, for a slice that
+    /// never changes.
+    taps: Vec<Tensor>,
+    /// `Σ_d taps[d]`, `[O, I, kH, kW]` — present when `kT > 1`. The single-frame collapse in
+    /// [`Self::forward`] convolves with this instead of running the tap loop.
+    tap_sum: Option<Tensor>,
+    bias: Tensor, // [1, O, 1, 1, 1]
     kt: usize,
     st: usize,
     sh: usize,
@@ -147,15 +158,64 @@ impl CausalConv3d {
         use_padding_causal: bool,
     ) -> candle_gen::Result<Self> {
         let weight = w.require(&format!("{prefix}.weight"))?.clone();
+        let bias = w.require(&format!("{prefix}.bias"))?.clone();
+        Ok(Self::from_weight(
+            &weight,
+            &bias,
+            stride,
+            padding,
+            use_padding_causal,
+        )?)
+    }
 
+    /// Build from an already-loaded `[O,I,kT,kH,kW]` weight and `[O]` bias, pre-splitting the temporal
+    /// taps and their sum. Shared by [`Self::load`] and the tests so both exercise the same derivation.
+    fn from_weight(
+        weight: &Tensor,
+        bias: &Tensor,
+        stride: (usize, usize, usize),
+        padding: (usize, usize, usize),
+        use_padding_causal: bool,
+    ) -> Result<Self> {
         let (_o, _i, kt, _kh, _kw) = weight.dims5()?;
-        let bias = w.require(&format!("{prefix}.bias"))?;
         let o = bias.dim(0)?;
         let bias = bias.reshape((1, o, 1, 1, 1))?;
         debug_assert_eq!(padding.1, padding.2, "seedvr2 conv: ph == pw");
         debug_assert_eq!(stride.1, stride.2, "seedvr2 conv: sh == sw");
+
+        let dev = weight.device().clone();
+        let dtype = weight.dtype();
+        // Narrow on the CPU (see `taps`), then upload each tap once.
+        let w_cpu = weight.to_device(&Device::Cpu)?;
+        let mut taps = Vec::with_capacity(kt);
+        for kd in 0..kt {
+            taps.push(
+                w_cpu
+                    .narrow(2, kd, 1)?
+                    .squeeze(2)?
+                    .contiguous()?
+                    .to_device(&dev)?,
+            );
+        }
+        // Fold the taps in f32 so an fp16 weight is summed exactly and rounded once, then store at the
+        // model dtype. (Rounding once here is if anything *better* than rounding each tap's conv
+        // output, which is what the tap loop does.)
+        let tap_sum = if kt > 1 {
+            Some(
+                w_cpu
+                    .to_dtype(DType::F32)?
+                    .sum(2)?
+                    .to_dtype(dtype)?
+                    .contiguous()?
+                    .to_device(&dev)?,
+            )
+        } else {
+            None
+        };
+
         Ok(Self {
-            weight,
+            taps,
+            tap_sum,
             bias,
             kt,
             st: stride.0,
@@ -170,14 +230,44 @@ impl CausalConv3d {
 
     /// `x`: `[B, C, T, H, W]` → `[B, O, T_out, H_out, W_out]`.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let (b, c, _t, h, w) = x.dims5()?;
-        // Temporal causal padding (repeat the first frame), or symmetric zero-pad for kt==1.
-        let xpad = if self.kt > 1 {
-            let causal_pad = if self.use_padding_causal {
+        let (b, c, t, h, w) = x.dims5()?;
+
+        // Padded temporal extent, computed rather than measured so the single-frame case below can be
+        // decided before anything is materialized.
+        let causal_pad = if self.kt > 1 {
+            if self.use_padding_causal {
                 2 * self.pt
             } else {
                 self.kt - 1
-            };
+            }
+        } else {
+            2 * self.pt
+        };
+        let tpad = t + causal_pad;
+        // VALID temporal conv with temporal stride → T_out output frames.
+        let t_out = (tpad - self.kt) / self.st + 1;
+
+        // ---- single-frame collapse -----------------------------------------------------------
+        // With T == 1 the causal padding is `causal_pad` repeats of the only frame, so *every* frame
+        // of the padded tensor is that same image — and every temporal tap therefore convolves it:
+        //
+        //     Σ_d conv2d(f, W[:, :, d])  ==  conv2d(f, Σ_d W[:, :, d])
+        //
+        // One conv2d instead of `kT`, and no padded copy built at all. This is an exact algebraic
+        // identity, not an approximation or a quality trade.
+        //
+        // It is not a corner case: T == 1 is the whole still-image path *and* the per-frame spatial
+        // tiling path that every HD video frame goes through, which is where the VAE accounts for
+        // ~80% of wall clock. A 3×3×3 conv there was doing three times the convolution it needed to.
+        if let (Some(wsum), 1, 1) = (&self.tap_sum, t, t_out) {
+            let frame = x.contiguous()?.reshape((b, c, h, w))?;
+            let y = chunked_conv2d(&frame, wsum, self.ph, self.sh)?;
+            let (_, o, hp, wp) = y.dims4()?;
+            return y.reshape((b, o, 1, hp, wp))?.broadcast_add(&self.bias);
+        }
+
+        // Temporal causal padding (repeat the first frame), or symmetric zero-pad for kt==1.
+        let xpad = if self.kt > 1 {
             if causal_pad > 0 {
                 let first = x.narrow(2, 0, 1)?; // [B,C,1,H,W]
                 let rep = first.broadcast_as((b, c, causal_pad, h, w))?.contiguous()?;
@@ -190,21 +280,13 @@ impl CausalConv3d {
         } else {
             x.clone()
         };
-        let tpad = xpad.dim(2)?;
-        // VALID temporal conv with temporal stride → T_out output frames.
-        let t_out = (tpad - self.kt) / self.st + 1;
+        debug_assert_eq!(xpad.dim(2)?, tpad, "computed temporal pad must match built");
         let dev = x.device();
 
         let mut acc: Option<Tensor> = None;
         for kd in 0..self.kt {
-            // Tap weight W[:, :, kd] → [O, I, kH, kW] (one conv2d).
-            let wk = self
-    .weight
-    .to_device(&candle_gen::candle_core::Device::Cpu)?
-    .narrow(2, kd, 1)?
-    .squeeze(2)?
-    .contiguous()?
-    .to_device(dev)?;
+            // Tap weight W[:, :, kd] → [O, I, kH, kW], sliced once at load (see `taps`).
+            let wk = &self.taps[kd];
             // The T_out frames this tap convolves: x_pad[:, :, kd + o·st], o in 0..T_out.
             let frames = if self.st == 1 {
                 xpad.narrow(2, kd, t_out)?
@@ -220,7 +302,7 @@ impl CausalConv3d {
                     .contiguous()?
                     .reshape((b * t_out, c, h, w))?;
             // Batch-chunked so each conv2d's im2col stays under candle's CUDA limit (see [`chunked_conv2d`]).
-            let y = chunked_conv2d(&merged, &wk, self.ph, self.sh)?;
+            let y = chunked_conv2d(&merged, wk, self.ph, self.sh)?;
             acc = Some(match acc {
                 Some(a) => (a + y)?,
                 None => y,
@@ -249,20 +331,8 @@ mod tests {
         pt: usize,
         upc: bool,
     ) -> CausalConv3d {
-        let (_o, _i, kt, _kh, _kw) = weight.dims5().unwrap();
-        let o = bias.dim(0).unwrap();
-        CausalConv3d {
-            weight,
-            bias: bias.reshape((1, o, 1, 1, 1)).unwrap(),
-            kt,
-            st,
-            sh: 1,
-            sw: 1,
-            pt,
-            ph,
-            pw: ph,
-            use_padding_causal: upc,
-        }
+        // Through `from_weight`, so the tests exercise the same tap/tap-sum derivation production uses.
+        CausalConv3d::from_weight(&weight, &bias, (st, 1, 1), (pt, ph, ph), upc).unwrap()
     }
 
     /// A 3×3×3 causal conv (stride 1, spatial pad 1) preserves T,H,W (causal repeat = 2 frames).
@@ -312,20 +382,45 @@ mod tests {
     #[test]
     fn matches_bruteforce_conv3d_t_gt_1() -> Result<()> {
         for st in [1usize, 2usize] {
-            bruteforce_conv3d_case(st)?;
+            bruteforce_conv3d_case(st, 18, false)?;
         }
         Ok(())
     }
 
-    fn bruteforce_conv3d_case(st: usize) -> Result<()> {
+    /// The single-frame collapse must land on the *same* brute-force ground truth as the tap loop.
+    ///
+    /// `forward` short-circuits `T == 1` to one conv2d against `Σ_d W[:, :, d]`, on the reasoning that
+    /// causal padding makes every tap see the same frame. That is the hot path for every still image
+    /// and every spatially-tiled HD video frame, so it is checked against the independent reference
+    /// rather than against the tap loop it replaces — a shared wrong assumption would cancel out.
+    /// Covers temporal stride 1 and 2, and both causal-pad rules (`kt-1` and `2·pt`, equal at pt=1).
+    #[test]
+    fn single_frame_collapse_matches_bruteforce() -> Result<()> {
+        for st in [1usize, 2usize] {
+            for upc in [false, true] {
+                bruteforce_conv3d_case(st, 1, upc)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn bruteforce_conv3d_case(st: usize, t: usize, upc: bool) -> Result<()> {
         let dev = Device::Cpu;
         let (o, i, kt, kh, kw) = (3usize, 2usize, 3usize, 3usize, 3usize);
-        let (t, h, w) = (18usize, 5usize, 5usize); // T large enough to exercise t_out=16+
+        let (h, w) = (5usize, 5usize);
         let ph = 1usize;
+        let pt = 1usize;
+        // The reference below assumes causal_pad == kt-1; at pt=1, kt=3 the `2·pt` rule agrees, so the
+        // same reference covers both. Guard it so a future kt/pt change fails loudly here.
+        assert_eq!(
+            if upc { 2 * pt } else { kt - 1 },
+            kt - 1,
+            "reference assumes causal_pad == kt-1"
+        );
         let wt = Tensor::randn(0f32, 1.0, (o, i, kt, kh, kw), &dev)?;
         let bias = Tensor::randn(0f32, 1.0, o, &dev)?;
         let x = Tensor::randn(0f32, 1.0, (1, i, t, h, w), &dev)?;
-        let c = conv(wt.clone(), bias.clone(), st, ph, 1, false);
+        let c = conv(wt.clone(), bias.clone(), st, ph, pt, upc);
         let got = c.forward(&x)?;
 
         // brute force
@@ -377,7 +472,7 @@ mod tests {
             .fold(0f32, f32::max);
         assert!(
             max_err < 1e-3,
-            "conv3d decomposition wrong at T>1 (st={st}): max_err={max_err}"
+            "conv3d decomposition wrong (T={t}, st={st}, upc={upc}): max_err={max_err}"
         );
         Ok(())
     }
